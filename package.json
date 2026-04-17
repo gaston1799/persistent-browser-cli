@@ -10,7 +10,8 @@
     "persistent-browser-cli": "./cli.js"
   },
   "scripts": {
-    "help": "node cli.js --help"
+    "help": "node cli.js --help",
+    "build:exe": "node scripts/build-exe.js"
   },
   "keywords": [
     "chrome",
@@ -24,5 +25,9 @@
   "dependencies": {
     "@playwright/cli": "^0.1.5",
     "playwright-core": "^1.59.1"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.11",
+    "postject": "^1.0.0-alpha.6"
   }
 }

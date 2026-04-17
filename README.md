@@ -61,6 +61,36 @@ cli sac
 
 `cli` is convenient, but on PowerShell it collides with the built-in `Clear-Item` alias. In practice you should use `pbc` or `pbc-cli`.
 
+## Windows EXE Build
+
+You can also build a Windows executable:
+
+```powershell
+npm install
+npm run build:exe
+```
+
+That writes:
+
+```powershell
+dist\pbc.exe
+```
+
+Example:
+
+```powershell
+.\dist\pbc.exe --help
+.\dist\pbc.exe doctor
+```
+
+Important constraints:
+
+- The EXE is a repo-local convenience binary, not a fully standalone packaged app.
+- It still expects the repo's installed dependencies to exist, so run `npm install` first.
+- In practice, `dist\pbc.exe` resolves `playwright-core` from the repo's `node_modules` directory.
+- The build process uses Node's single-executable application workflow plus `postject` on Node versions that do not yet support `--build-sea` directly.
+- On Windows, the build may print a signature warning after injection. That is expected for a local unsigned build.
+
 ## Persistent Profile Setup
 
 By default the CLI uses:
@@ -207,4 +237,4 @@ If a ref-based command fails, the wrapper automatically runs a fresh `snapshot` 
 - Do **not** run two separate Chrome processes against the same `PBC_USER_DATA_DIR` at the same time.
 - Using multiple tabs in the same browser is fine.
 - The PowerShell launch/backup scripts are Windows-specific by design.
-- If you want a real `.exe`, Node's official single-executable app support exists, but it is still in active development and is a worse fit than npm command shims for this repo's current structure.
+- For PATH-based everyday use, `npm link` plus `pbc` / `pbc-cli` is still the cleaner workflow than calling the built EXE directly.

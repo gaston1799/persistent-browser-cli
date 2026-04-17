@@ -3,6 +3,7 @@
 
 const fs = require("node:fs");
 const http = require("node:http");
+const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
@@ -25,6 +26,11 @@ const {
 } = require("./tab_tools");
 
 const ROOT = __dirname;
+let seaApi = null;
+
+try {
+  seaApi = require("node:sea");
+} catch {}
 
 function usage(exitCode = 0) {
   const txt = `
@@ -129,13 +135,35 @@ async function countCdpPageTargets(port) {
 }
 
 function runPwsh(ps1, args = []) {
-  const script = path.join(ROOT, ps1);
+  const script = resolveScriptPath(ps1);
   const result = spawnSync(
     "powershell",
     ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, ...args],
     { stdio: "inherit", cwd: ROOT }
   );
   process.exit(result.status ?? 1);
+}
+
+function isSeaRuntime() {
+  return Boolean(seaApi && typeof seaApi.isSea === "function" && seaApi.isSea());
+}
+
+function resolveScriptPath(ps1) {
+  if (!isSeaRuntime()) {
+    return path.join(ROOT, ps1);
+  }
+
+  const tempRoot = path.join(os.tmpdir(), "persistent-browser-cli-sea");
+  fs.mkdirSync(tempRoot, { recursive: true });
+  const targetPath = path.join(tempRoot, ps1);
+  if (!fs.existsSync(targetPath)) {
+    const asset = seaApi.getAsset(ps1);
+    if (!asset) {
+      throw new Error(`Embedded SEA asset not found: ${ps1}`);
+    }
+    fs.writeFileSync(targetPath, Buffer.from(asset));
+  }
+  return targetPath;
 }
 
 function runPlaywrightCli(args) {
