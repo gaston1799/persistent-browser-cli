@@ -208,18 +208,27 @@ pbc backup --kill
 The `pw` command forwards to `playwright-cli`, defaulting to:
 - Chrome
 - headed mode
-- persistent profile
-- the configured profile directory
+- session name `persistent-browser-cli`
+
+It does **not** automatically force `--persistent` or `--profile`. That is intentional. The installed Playwright CLI version does not reliably hand off between a Playwright-managed browser and the separate CDP browser started by `pbc open`, and forcing the same profile directory causes browser-lock conflicts.
 
 Examples:
 
 ```powershell
 pbc pw open https://example.com
-pbc pw snapshot
-pbc pw click e15
-pbc pw fill e3 "hello"
-pbc pw screenshot
+pbc pw list --all
+pbc pw close-all
 ```
+
+If you want a persistent Playwright profile, pass it explicitly:
+
+```powershell
+pbc pw open https://example.com --persistent --profile C:\path\to\profile
+```
+
+Do not point that at the same profile directory that `pbc open` is already using.
+
+The `@playwright/cli` session model is version-sensitive. On some machines, `open` keeps a live session you can continue to drive; on others, the session may already be closed by the time the next command runs. Use `pbc pw list --all` to confirm the browser is actually still open before assuming follow-up commands like `snapshot` or `click` will attach.
 
 If a ref-based command fails, the wrapper automatically runs a fresh `snapshot` so you can keep going.
 
@@ -229,7 +238,7 @@ If a ref-based command fails, the wrapper automatically runs a fresh `snapshot` 
 2. log in or navigate manually
 3. `pbc tab list`
 4. `pbc tab inspect active` if you need to understand the page
-5. `pbc pw ...` for interactive Playwright CLI work
+5. `pbc pw ...` for Playwright CLI work in its own session
 6. `pbc sac` when you are done
 
 ## Notes

@@ -169,22 +169,17 @@ function resolveScriptPath(ps1) {
 function runPlaywrightCli(args) {
   const localPwCli = path.join(ROOT, "node_modules", "@playwright", "cli", "playwright-cli.js");
   const hasLocal = fs.existsSync(localPwCli);
-  const hasSession = args.some((a) => a === "--session" || String(a).startsWith("--session=") || a === "-s" || String(a).startsWith("-s="));
-  const effectiveArgs = hasSession ? args : ["--session", DEFAULT_PWCLI_SESSION, ...args];
+  const hasSession = args.some((a) => a === "-s" || String(a).startsWith("-s=") || a === "--session" || String(a).startsWith("--session="));
 
   const sub = args[0];
   if (sub === "open") {
     const hasBrowser = args.some((a) => a === "--browser" || String(a).startsWith("--browser="));
     const hasHeaded = args.includes("--headed");
-    const hasPersistent = args.includes("--persistent");
-    const hasProfile = args.some((a) => a === "--profile" || String(a).startsWith("--profile="));
     if (!hasBrowser) args = [...args, "--browser", "chrome"];
     if (!hasHeaded) args = [...args, "--headed"];
-    if (!hasPersistent) args = [...args, "--persistent"];
-    if (!hasProfile) args = [...args, "--profile", USER_DATA_DIR];
   }
 
-  const runArgs = hasSession ? args : ["--session", DEFAULT_PWCLI_SESSION, ...args];
+  const runArgs = hasSession ? args : [`-s=${DEFAULT_PWCLI_SESSION}`, ...args];
   let result;
   if (hasLocal) {
     result = spawnSync(process.execPath, [localPwCli, ...runArgs], { stdio: "inherit", cwd: ROOT });
@@ -317,7 +312,7 @@ async function main() {
     const up = await isCdpUp(port);
     if (!up) {
       console.log(`CDP: DOWN (http://127.0.0.1:${port})`);
-      process.exit(2);
+      return 2;
     }
 
     const result = await saveAndCloseBrowser(port);
@@ -333,13 +328,13 @@ async function main() {
     for (let i = 0; i < 20; i += 1) {
       if (!(await isCdpUp(port))) {
         console.log("[pbc] Browser closed cleanly and the persistent profile should be flushed to disk.");
-        process.exit(0);
+        return 0;
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
 
     console.log("[pbc] Browser.close was requested, but CDP still appears up. You may need to close Chrome manually.");
-    process.exit(1);
+    return 1;
   }
 
   if (cmd === "backup") {
@@ -480,7 +475,11 @@ async function main() {
   usage(1);
 }
 
-main().catch((error) => {
+main()
+  .then((code) => {
+    if (typeof code === "number") process.exitCode = code;
+  })
+  .catch((error) => {
   console.error(error);
   process.exit(1);
-});
+  });
