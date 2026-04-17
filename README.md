@@ -40,7 +40,26 @@ That gives you:
 
 ```powershell
 pbc --help
+pbc-cli --help
+persistent-browser-cli --help
+cli --help
 ```
+
+For local development without a full global publish, you can also use:
+
+```powershell
+npm link
+```
+
+That creates the command shims from this working copy so you can run:
+
+```powershell
+cli open https://example.com
+cli cdp
+cli sac
+```
+
+`cli` is convenient, but on PowerShell it collides with the built-in `Clear-Item` alias. In practice you should use `pbc` or `pbc-cli`.
 
 ## Persistent Profile Setup
 
@@ -64,6 +83,17 @@ $env:PBC_BACKUP_ROOT = 'D:\browser-profiles\backups'
 $env:PBC_CDP_PORT = '9333'
 $env:PBC_PWCLI_SESSION = 'my-browser-session'
 ```
+
+For machine-specific defaults that should not be committed, create `config.local.json` in the repo root. Example:
+
+```json
+{
+  "USER_DATA_DIR": "C:\\Users\\yourname\\playwright-persistent-contexts\\chrome-jobhunt",
+  "DEFAULT_CDP_PORT": 9223
+}
+```
+
+`config.local.json` is ignored by git and is applied after built-in defaults but before environment variables.
 
 ## First Run
 
@@ -169,3 +199,4 @@ If a ref-based command fails, the wrapper automatically runs a fresh `snapshot` 
 - Do **not** run two separate Chrome processes against the same `PBC_USER_DATA_DIR` at the same time.
 - Using multiple tabs in the same browser is fine.
 - The PowerShell launch/backup scripts are Windows-specific by design.
+- If you want a real `.exe`, Node's official single-executable app support exists, but it is still in active development and is a worse fit than npm command shims for this repo's current structure.

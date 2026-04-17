@@ -1,5 +1,6 @@
 const os = require("node:os");
 const path = require("node:path");
+const fs = require("node:fs");
 
 function envInt(name, fallback) {
   const raw = process.env[name];
@@ -24,10 +25,23 @@ const DATA_ROOT =
   process.env.PBC_DATA_ROOT ||
   path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "persistent-browser-cli");
 
+function loadLocalOverrides() {
+  const localPath = path.join(__dirname, "config.local.json");
+  if (!fs.existsSync(localPath)) return {};
+
+  try {
+    return JSON.parse(fs.readFileSync(localPath, "utf8"));
+  } catch (error) {
+    throw new Error(`Failed to parse ${localPath}: ${error.message}`);
+  }
+}
+
+const local = loadLocalOverrides();
+
 module.exports = {
-  CHROME_EXE: resolveChromeExe(),
-  USER_DATA_DIR: process.env.PBC_USER_DATA_DIR || path.join(DATA_ROOT, "profiles", "default"),
-  BACKUP_ROOT: process.env.PBC_BACKUP_ROOT || path.join(DATA_ROOT, "backups"),
-  DEFAULT_CDP_PORT: envInt("PBC_CDP_PORT", 9222),
-  DEFAULT_PWCLI_SESSION: process.env.PBC_PWCLI_SESSION || "persistent-browser-cli",
+  CHROME_EXE: process.env.PBC_CHROME_EXE || local.CHROME_EXE || resolveChromeExe(),
+  USER_DATA_DIR: process.env.PBC_USER_DATA_DIR || local.USER_DATA_DIR || path.join(DATA_ROOT, "profiles", "default"),
+  BACKUP_ROOT: process.env.PBC_BACKUP_ROOT || local.BACKUP_ROOT || path.join(DATA_ROOT, "backups"),
+  DEFAULT_CDP_PORT: envInt("PBC_CDP_PORT", local.DEFAULT_CDP_PORT || 9222),
+  DEFAULT_PWCLI_SESSION: process.env.PBC_PWCLI_SESSION || local.DEFAULT_PWCLI_SESSION || "persistent-browser-cli",
 };

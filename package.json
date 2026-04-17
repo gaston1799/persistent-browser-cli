@@ -4,7 +4,9 @@
   "description": "A Windows-focused CLI for driving a persistent Chrome profile over CDP and Playwright.",
   "type": "commonjs",
   "bin": {
+    "cli": "./cli.js",
     "pbc": "./cli.js",
+    "pbc-cli": "./cli.js",
     "persistent-browser-cli": "./cli.js"
   },
   "scripts": {
