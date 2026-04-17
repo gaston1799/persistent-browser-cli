@@ -44,7 +44,7 @@ Usage:
   pbc sac [--port 9222]
   pbc backup [--kill]
 
-  pbc tab list [--port 9222]
+  pbc tab list [--all] [--port 9222]
   pbc tab activate <id|match> [--port 9222]
   pbc tab goto <id|match|active> <url> [--port 9222]
   pbc tab close <id|match> [--port 9222]
@@ -358,7 +358,7 @@ async function main() {
     }
 
     if (sub === "list") {
-      const tabs = await listTabs(port);
+      const tabs = await listTabs(port, { includeInternal: hasFlag("--all", argv) });
       if (!tabs.length) {
         console.log("[pbc] No tabs found.");
         process.exit(0);

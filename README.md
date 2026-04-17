@@ -163,11 +163,14 @@ List and reuse tabs:
 
 ```powershell
 pbc tab list
+pbc tab list --all
 pbc tab activate 2
 pbc tab goto active https://mail.google.com
 pbc tab close 2
 pbc tab prune
 ```
+
+By default, `pbc tab list` hides Chrome internal/system pages like omnibox popups and extension pages. Use `--all` when you want the raw full tab list.
 
 Inspect frames and form controls:
 

@@ -6,6 +6,17 @@ function formatTabLabel(tab) {
   return `${marker} [${tab.id}] ${tab.url}${title}`;
 }
 
+function isInternalTab(tab) {
+  const url = String(tab?.url || "").toLowerCase();
+  return (
+    url.startsWith("chrome://") ||
+    url.startsWith("devtools://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("chrome-extension://") ||
+    url === "about:blank"
+  );
+}
+
 function normalizeUrl(value) {
   try {
     const url = new URL(value);
@@ -59,7 +70,16 @@ function resolveTab(tabs, token) {
 
   const raw = String(token == null ? "active" : token).trim();
   if (!raw || /^(active|current)$/i.test(raw)) {
-    return tabs.find((tab) => tab.active) || tabs[tabs.length - 1];
+    const activeVisible = tabs.find((tab) => tab.active && !isInternalTab(tab));
+    if (activeVisible) return activeVisible;
+
+    const activeAny = tabs.find((tab) => tab.active);
+    if (activeAny && !isInternalTab(activeAny)) return activeAny;
+
+    const lastVisible = [...tabs].reverse().find((tab) => !isInternalTab(tab));
+    if (lastVisible) return lastVisible;
+
+    return activeAny || tabs[tabs.length - 1];
   }
 
   const byId = raw.replace(/^tab:/i, "").replace(/^p/i, "");
@@ -78,20 +98,23 @@ function resolveTab(tabs, token) {
   throw new Error(`Could not find a tab matching "${raw}".`);
 }
 
-async function listTabs(port) {
-  return withResolvedTabList(port);
+async function listTabs(port, options = {}) {
+  return withResolvedTabList(port, options);
 }
 
-async function withResolvedTabList(port) {
+async function withResolvedTabList(port, options = {}) {
   const { browser, tabs } = await connectPages(port);
   try {
-    return tabs.map((tab) => ({
-      id: tab.id,
-      url: tab.url,
-      title: tab.title,
-      active: tab.active,
-      label: formatTabLabel(tab),
-    }));
+    const includeInternal = Boolean(options.includeInternal);
+    return tabs
+      .filter((tab) => includeInternal || !isInternalTab(tab))
+      .map((tab) => ({
+        id: tab.id,
+        url: tab.url,
+        title: tab.title,
+        active: tab.active,
+        label: formatTabLabel(tab),
+      }));
   } finally {
     await browser.close().catch(() => {});
   }
@@ -383,6 +406,7 @@ module.exports = {
   closeTab,
   gotoTab,
   inspectFields,
+  isInternalTab,
   listFrames,
   listTabs,
   pruneDuplicateTabs,
