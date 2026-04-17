@@ -121,6 +121,14 @@ Check whether CDP is up:
 pbc cdp
 ```
 
+Run a quick environment check:
+
+```powershell
+pbc doctor
+```
+
+This verifies the effective Chrome path, profile path, backup path, command shims, and whether the configured CDP endpoint is reachable.
+
 List and reuse tabs:
 
 ```powershell

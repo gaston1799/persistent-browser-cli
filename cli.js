@@ -33,6 +33,7 @@ persistent-browser-cli
 Usage:
   pbc open [url] [--port 9222] [--reuse] [--match "<text>"] [--tab <id>]
   pbc cdp [--port 9222]
+  pbc doctor [--port 9222]
   pbc saveandclose [--port 9222]
   pbc sac [--port 9222]
   pbc backup [--kill]
@@ -75,6 +76,31 @@ function hasFlag(flag, argv) {
   return argv.includes(flag);
 }
 
+function formatStatus(ok, label, detail) {
+  return `[${ok ? "OK" : "WARN"}] ${label}: ${detail}`;
+}
+
+function formatInfo(label, detail) {
+  return `[INFO] ${label}: ${detail}`;
+}
+
+function findCommand(command) {
+  const result = spawnSync("where.exe", [command], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if ((result.status ?? 1) !== 0) return [];
+  return String(result.stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function getProfileLockFiles(userDataDir) {
+  const names = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
+  return names.filter((name) => fs.existsSync(path.join(userDataDir, name)));
+}
+
 async function isCdpUp(port) {
   return new Promise((resolve) => {
     const req = http.request(
@@ -91,6 +117,15 @@ async function isCdpUp(port) {
     req.on("error", () => resolve(false));
     req.end();
   });
+}
+
+async function countCdpPageTargets(port) {
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+  if (!response.ok) {
+    throw new Error(`Could not read CDP target list on port ${port}.`);
+  }
+  const targets = await response.json();
+  return targets.filter((target) => target.type === "page").length;
 }
 
 function runPwsh(ps1, args = []) {
@@ -185,6 +220,68 @@ async function main() {
     }
     console.log(`CDP: DOWN (http://127.0.0.1:${port})`);
     process.exit(2);
+  }
+
+  if (cmd === "doctor") {
+    const port = Number(readArg("--port", argv) || DEFAULT_CDP_PORT);
+    const lines = [];
+    let hardFailures = 0;
+
+    const chromeExists = fs.existsSync(CHROME_EXE);
+    lines.push(formatStatus(chromeExists, "chrome executable", chromeExists ? CHROME_EXE : `${CHROME_EXE} (not found)`));
+    if (!chromeExists) hardFailures += 1;
+
+    const profileExists = fs.existsSync(USER_DATA_DIR);
+    lines.push(
+      formatStatus(
+        profileExists,
+        "user data dir",
+        profileExists ? USER_DATA_DIR : `${USER_DATA_DIR} (will be created on first launch)`
+      )
+    );
+
+    const backupExists = fs.existsSync(BACKUP_ROOT);
+    lines.push(
+      formatStatus(
+        backupExists,
+        "backup root",
+        backupExists ? BACKUP_ROOT : `${BACKUP_ROOT} (missing until first backup)`
+      )
+    );
+
+    const cdpUp = await isCdpUp(port);
+    lines.push(formatStatus(cdpUp, "cdp endpoint", `http://127.0.0.1:${port} ${cdpUp ? "is reachable" : "is down"}`));
+
+    if (cdpUp) {
+      try {
+        const tabs = await countCdpPageTargets(port);
+        lines.push(formatInfo("open tabs", `${tabs}`));
+      } catch (error) {
+        lines.push(formatStatus(false, "open tabs", error.message || String(error)));
+      }
+    }
+
+    const lockFiles = getProfileLockFiles(USER_DATA_DIR);
+    if (cdpUp) {
+      lines.push(formatStatus(true, "profile ownership", `profile is attached to the active CDP browser on port ${port}`));
+    } else if (lockFiles.length) {
+      lines.push(formatStatus(true, "profile ownership", `profile lock files are present: ${lockFiles.join(", ")}`));
+    } else {
+      lines.push(formatStatus(false, "profile ownership", "could not confirm active use; CDP is down and no profile lock files were found"));
+    }
+
+    const pbcHits = findCommand("pbc");
+    const pbcCliHits = findCommand("pbc-cli");
+    const fullHits = findCommand("persistent-browser-cli");
+    lines.push(formatStatus(pbcHits.length > 0, "command shim pbc", pbcHits[0] || "not found in PATH"));
+    lines.push(formatStatus(pbcCliHits.length > 0, "command shim pbc-cli", pbcCliHits[0] || "not found in PATH"));
+    lines.push(formatStatus(fullHits.length > 0, "command shim persistent-browser-cli", fullHits[0] || "not found in PATH"));
+    lines.push(formatInfo("powershell alias note", "`cli` collides with Clear-Item, so use `pbc` or `pbc-cli`"));
+
+    console.log("persistent-browser-cli doctor");
+    console.log(`Defaults: port=${port} | session=${DEFAULT_PWCLI_SESSION}`);
+    for (const line of lines) console.log(line);
+    process.exit(hardFailures ? 1 : 0);
   }
 
   if (cmd === "saveandclose" || cmd === "sac") {
