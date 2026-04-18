@@ -5,11 +5,11 @@ A Windows-focused CLI for driving a persistent Chrome profile over CDP and Playw
 This repo is the reusable subset of the custom browser tooling:
 - launch Chrome with a persistent profile
 - reuse or navigate existing tabs
-- inspect form controls and frames over CDP
+- inspect pages, frames, form controls, and interact with tabs over CDP
 - close duplicate tabs
 - back up the persistent profile
 - shut the browser down cleanly with `Browser.close`
-- forward normal Playwright CLI commands while reusing the same persistent profile
+- forward normal Playwright CLI commands when you intentionally want a separate Playwright CLI session
 
 ## Scope
 
@@ -180,6 +180,31 @@ pbc tab inspect active
 pbc tab inspect active --frame gmail
 ```
 
+Drive the already-open persistent Chrome tab directly over CDP:
+
+```powershell
+pbc tab snapshot active
+pbc tab text active
+pbc tab click active e3
+pbc tab fill active e7 "naquan@example.com"
+pbc tab screenshot active .\output\page.png
+pbc tab eval active "document.title"
+```
+
+These commands attach to the Chrome instance started by `pbc open`, so they use the same logged-in persistent profile and the same tabs. They do not go through `pbc pw`.
+
+Useful variants:
+
+```powershell
+pbc tab snapshot active --frame gmail
+pbc tab snapshot active --json
+pbc tab text active --json
+pbc tab screenshot active --full-page
+pbc tab eval active "Array.from(document.links).map(a => a.href)" --json
+```
+
+`snapshot` prints stable refs like `e0`, `e1`, `e2`. Use those refs immediately with `click` or `fill`. Re-run `snapshot` after navigation, reloads, or large DOM changes because refs can go stale.
+
 Graceful shutdown:
 
 ```powershell
@@ -235,14 +260,25 @@ The `@playwright/cli` session model is version-sensitive. On some machines, `ope
 
 If a ref-based command fails, the wrapper automatically runs a fresh `snapshot` so you can keep going.
 
+For day-to-day work against your logged-in persistent Chrome, prefer the CDP-native commands:
+
+```powershell
+pbc open https://example.com
+pbc tab snapshot active
+pbc tab click active e0
+```
+
+Use `pbc pw` only when you intentionally want the external Playwright CLI workflow.
+
 ## Recommended Workflow
 
 1. `pbc open <url>`
 2. log in or navigate manually
 3. `pbc tab list`
-4. `pbc tab inspect active` if you need to understand the page
-5. `pbc pw ...` for Playwright CLI work in its own session
-6. `pbc sac` when you are done
+4. `pbc tab snapshot active` or `pbc tab inspect active` if you need to understand the page
+5. `pbc tab click/fill/text/eval` for automation inside the same persistent Chrome instance
+6. `pbc pw ...` only for Playwright CLI work in its own session
+7. `pbc sac` when you are done
 
 ## Notes
 

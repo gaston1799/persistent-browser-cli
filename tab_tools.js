@@ -283,6 +283,229 @@ async function inspectFields(port, token, options = {}) {
   });
 }
 
+function resolveFrame(page, frameNeedle) {
+  const needle = String(frameNeedle || "").trim().toLowerCase();
+  if (!needle) return page.mainFrame();
+
+  return page.frames().find((frame) => {
+    return (
+      (frame.name() || "").toLowerCase().includes(needle) ||
+      frame.url().toLowerCase().includes(needle)
+    );
+  });
+}
+
+function looksLikeSelector(target) {
+  return /^[.#\[]/.test(target) || /^(input|textarea|select|button|a|label|form|div|span)\b/i.test(target) || /^\/\//.test(target);
+}
+
+async function snapshotTab(port, token, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    const frame = resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const items = await frame.evaluate(() => {
+      const selector = [
+        "a",
+        "button",
+        "input",
+        "select",
+        "textarea",
+        "[role]",
+        "[contenteditable='true']",
+      ].join(",");
+
+      function getLabel(node) {
+        const aria = node.getAttribute("aria-label");
+        if (aria) return aria.trim();
+
+        const labelledBy = node.getAttribute("aria-labelledby");
+        if (labelledBy) {
+          const text = labelledBy
+            .split(/\s+/)
+            .map((id) => document.getElementById(id)?.textContent?.trim() || "")
+            .filter(Boolean)
+            .join(" ");
+          if (text) return text;
+        }
+
+        if (node.id) {
+          const label = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
+          if (label?.textContent) return label.textContent.trim();
+        }
+
+        const closest = node.closest("label");
+        if (closest?.textContent) return closest.textContent.trim();
+
+        return "";
+      }
+
+      return Array.from(document.querySelectorAll(selector))
+        .filter((node) => {
+          const style = window.getComputedStyle(node);
+          const rect = node.getBoundingClientRect();
+          return (
+            style.visibility !== "hidden" &&
+            style.display !== "none" &&
+            rect.width > 0 &&
+            rect.height > 0
+          );
+        })
+        .map((node, index) => {
+          const tag = node.tagName.toLowerCase();
+          const type = node.getAttribute("type") || "";
+          const role = node.getAttribute("role") || "";
+          const name = node.getAttribute("name") || "";
+          const id = node.id || "";
+          const aria = node.getAttribute("aria-label") || "";
+          const placeholder = node.getAttribute("placeholder") || "";
+          const text = (node.innerText || node.textContent || "").trim().replace(/\s+/g, " ").slice(0, 160);
+          const value = "value" in node ? String(node.value || "").slice(0, 160) : "";
+          const label = (getLabel(node) || aria || placeholder || text || value).replace(/\s+/g, " ").slice(0, 160);
+
+          node.setAttribute("data-pbc-ref", `e${index}`);
+
+          return {
+            ref: `e${index}`,
+            tag,
+            role,
+            type,
+            name,
+            id,
+            label,
+            text,
+            value,
+            disabled: Boolean(node.disabled || node.getAttribute("aria-disabled") === "true"),
+          };
+        });
+    });
+
+    return {
+      tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) },
+      frame: { name: frame.name() || "", url: frame.url() },
+      items,
+    };
+  });
+}
+
+async function textTab(port, token, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    const frame = resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const text = await frame.evaluate(() => {
+      const source = document.body?.innerText || document.documentElement?.textContent || "";
+      return source.trim().replace(/\n{3,}/g, "\n\n");
+    });
+
+    return {
+      tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) },
+      frame: { name: frame.name() || "", url: frame.url() },
+      text,
+    };
+  });
+}
+
+async function clickTab(port, token, target, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    const frame = resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const raw = String(target || "").trim();
+    if (!raw) throw new Error("Click target is required.");
+
+    if (/^e\d+$/i.test(raw)) {
+      const ref = raw.toLowerCase();
+      await frame.locator(`[data-pbc-ref="${ref}"]`).first().click();
+      return { clicked: ref, mode: "ref", url: tab.page.url() };
+    }
+
+    if (looksLikeSelector(raw)) {
+      await frame.locator(raw).first().click();
+      return { clicked: raw, mode: "selector", url: tab.page.url() };
+    }
+
+    await frame.getByText(raw, { exact: false }).first().click();
+    return { clicked: raw, mode: "text", url: tab.page.url() };
+  });
+}
+
+async function fillLocator(locator, value) {
+  try {
+    await locator.fill(value);
+    return "fill";
+  } catch (error) {
+    const tag = await locator.evaluate((node) => node.tagName.toLowerCase()).catch(() => "");
+    if (tag !== "select") throw error;
+
+    try {
+      await locator.selectOption({ label: value });
+      return "select-label";
+    } catch {
+      await locator.selectOption(value);
+      return "select-value";
+    }
+  }
+}
+
+async function fillTab(port, token, target, value, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    const frame = resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const raw = String(target || "").trim();
+    if (!raw) throw new Error("Fill target is required.");
+
+    if (/^e\d+$/i.test(raw)) {
+      const ref = raw.toLowerCase();
+      const method = await fillLocator(frame.locator(`[data-pbc-ref="${ref}"]`).first(), value);
+      return { filled: ref, mode: "ref", method, url: tab.page.url() };
+    }
+
+    if (looksLikeSelector(raw)) {
+      const method = await fillLocator(frame.locator(raw).first(), value);
+      return { filled: raw, mode: "selector", method, url: tab.page.url() };
+    }
+
+    try {
+      const method = await fillLocator(frame.getByLabel(raw, { exact: false }).first(), value);
+      return { filled: raw, mode: "label", method, url: tab.page.url() };
+    } catch {
+      const method = await fillLocator(frame.getByPlaceholder(raw, { exact: false }).first(), value);
+      return { filled: raw, mode: "placeholder", method, url: tab.page.url() };
+    }
+  });
+}
+
+async function screenshotTab(port, token, outputPath, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    await tab.page.screenshot({ path: outputPath, fullPage: Boolean(options.fullPage) });
+    return { path: outputPath, url: tab.page.url() };
+  });
+}
+
+async function evalTab(port, token, source, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    const frame = resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const value = await frame.evaluate(async (script) => {
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      try {
+        return await new AsyncFunction(`return (${script});`)();
+      } catch {
+        return await new AsyncFunction(script)();
+      }
+    }, source);
+
+    return {
+      tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) },
+      frame: { name: frame.name() || "", url: frame.url() },
+      value,
+    };
+  });
+}
+
 async function requestBrowserClose(port) {
   let response;
   try {
@@ -403,7 +626,10 @@ async function saveAndCloseBrowser(port) {
 
 module.exports = {
   activateTab,
+  clickTab,
   closeTab,
+  evalTab,
+  fillTab,
   gotoTab,
   inspectFields,
   isInternalTab,
@@ -411,5 +637,8 @@ module.exports = {
   listTabs,
   pruneDuplicateTabs,
   saveAndCloseBrowser,
+  screenshotTab,
+  snapshotTab,
+  textTab,
   reuseOrOpenTab,
 };

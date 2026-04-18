@@ -25,7 +25,7 @@ $args = @(
   "--remote-debugging-port=$RemoteDebuggingPort",
   "--remote-debugging-address=127.0.0.1",
   "--remote-allow-origins=*",
-  "--user-data-dir=$UserDataDir",
+  "--user-data-dir=`"$UserDataDir`"",
   "--profile-directory=Default",
   "--new-window",
   "--start-maximized",

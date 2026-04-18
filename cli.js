@@ -15,13 +15,19 @@ const {
 } = require("./config");
 const {
   activateTab,
+  clickTab,
   closeTab,
+  evalTab,
+  fillTab,
   gotoTab,
   inspectFields,
   listFrames,
   listTabs,
   pruneDuplicateTabs,
   saveAndCloseBrowser,
+  screenshotTab,
+  snapshotTab,
+  textTab,
   reuseOrOpenTab,
 } = require("./tab_tools");
 
@@ -50,6 +56,12 @@ Usage:
   pbc tab close <id|match> [--port 9222]
   pbc tab frames <id|match|active> [--port 9222]
   pbc tab inspect <id|match|active> [--frame <name-or-url>] [--port 9222]
+  pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]
+  pbc tab text <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]
+  pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--port 9222]
+  pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--port 9222]
+  pbc tab screenshot <id|match|active> [path] [--full-page] [--port 9222]
+  pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--port 9222]
   pbc tab prune [--port 9222] [--keep <id|match>]
 
   pbc pw <playwright-cli args...>
@@ -80,6 +92,25 @@ function readArg(flag, argv) {
 
 function hasFlag(flag, argv) {
   return argv.includes(flag);
+}
+
+function positionalArgs(argv) {
+  const result = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const value = argv[i];
+    if (value === "--port" || value === "--frame" || value === "--keep" || value === "--match" || value === "--tab") {
+      i += 1;
+      continue;
+    }
+    if (value === "--json" || value === "--full-page" || value === "--all" || value === "--reuse") {
+      continue;
+    }
+    if (String(value || "").startsWith("--")) {
+      continue;
+    }
+    result.push(value);
+  }
+  return result;
 }
 
 function formatStatus(ok, label, detail) {
@@ -193,6 +224,41 @@ function runPlaywrightCli(args) {
     console.error("[pbc] Failed to run Playwright CLI:", result.error.message || result.error);
   }
   return result.status ?? 1;
+}
+
+function printJson(value) {
+  console.log(JSON.stringify(value, null, 2));
+}
+
+function renderSnapshot(info) {
+  console.log(`[pbc] Tab: [${info.tab.id}] ${info.tab.url}`);
+  console.log(`[pbc] Frame: ${info.frame.name || "(no name)"} | ${info.frame.url}`);
+  if (!info.items.length) {
+    console.log("[pbc] No visible interactive elements found.");
+    return;
+  }
+
+  for (const item of info.items) {
+    const bits = [
+      `[${item.ref}]`,
+      item.tag,
+      item.type ? `type=${item.type}` : null,
+      item.role ? `role=${item.role}` : null,
+      item.disabled ? "disabled" : null,
+      item.name ? `name=${item.name}` : null,
+      item.id ? `id=${item.id}` : null,
+      item.label ? `label=${JSON.stringify(item.label)}` : null,
+      item.value && item.tag !== "button" ? `value=${JSON.stringify(item.value)}` : null,
+    ].filter(Boolean);
+    console.log(bits.join(" | "));
+  }
+}
+
+function defaultScreenshotPath() {
+  const outDir = path.join(ROOT, "output");
+  fs.mkdirSync(outDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return path.join(outDir, `pbc-screenshot-${stamp}.png`);
 }
 
 async function main() {
@@ -438,6 +504,96 @@ async function main() {
         ].filter(Boolean);
         console.log(parts.join(" | "));
       }
+      process.exit(0);
+    }
+
+    if (sub === "snapshot") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const frame = readArg("--frame", argv);
+      if (!token || token.startsWith("-")) {
+        console.log("Usage: pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]");
+        process.exit(1);
+      }
+      const info = await snapshotTab(port, token, { frame });
+      if (hasFlag("--json", argv)) printJson(info);
+      else renderSnapshot(info);
+      process.exit(0);
+    }
+
+    if (sub === "text") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const frame = readArg("--frame", argv);
+      if (!token || token.startsWith("-")) {
+        console.log("Usage: pbc tab text <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]");
+        process.exit(1);
+      }
+      const info = await textTab(port, token, { frame });
+      if (hasFlag("--json", argv)) printJson(info);
+      else {
+        console.log(`[pbc] Frame: ${info.frame.name || "(no name)"} | ${info.frame.url}`);
+        console.log(info.text);
+      }
+      process.exit(0);
+    }
+
+    if (sub === "click") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args.slice(1).join(" ");
+      const frame = readArg("--frame", argv);
+      if (!token || !target) {
+        console.log("Usage: pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await clickTab(port, token, target, { frame });
+      console.log(`[pbc] Clicked ${result.mode} ${JSON.stringify(result.clicked)}.`);
+      process.exit(0);
+    }
+
+    if (sub === "fill") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args[1];
+      const value = args.slice(2).join(" ");
+      const frame = readArg("--frame", argv);
+      if (!token || !target || value.length === 0) {
+        console.log("Usage: pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await fillTab(port, token, target, value, { frame });
+      console.log(`[pbc] Filled ${result.mode} ${JSON.stringify(result.filled)} using ${result.method}.`);
+      process.exit(0);
+    }
+
+    if (sub === "screenshot") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const outputPath = path.resolve(args[1] || defaultScreenshotPath());
+      if (!token || token.startsWith("-")) {
+        console.log("Usage: pbc tab screenshot <id|match|active> [path] [--full-page] [--port 9222]");
+        process.exit(1);
+      }
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+      const result = await screenshotTab(port, token, outputPath, { fullPage: hasFlag("--full-page", argv) });
+      console.log(`[pbc] Screenshot saved: ${result.path}`);
+      process.exit(0);
+    }
+
+    if (sub === "eval") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const source = args.slice(1).join(" ");
+      const frame = readArg("--frame", argv);
+      if (!token || !source) {
+        console.log("Usage: pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await evalTab(port, token, source, { frame });
+      if (hasFlag("--json", argv)) printJson(result);
+      else if (typeof result.value === "string") console.log(result.value);
+      else printJson(result.value);
       process.exit(0);
     }
 
