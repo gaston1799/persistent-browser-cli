@@ -583,7 +583,14 @@ async function main() {
       }
       const frames = await listFrames(port, token);
       for (const frame of frames) {
-        console.log(`${frame.isMain ? "*" : " "} [${frame.index}] ${frame.name || "(no name)"} | ${frame.url}`);
+        const element = frame.element
+          ? [
+              frame.element.id ? `id=${frame.element.id}` : null,
+              frame.element.name ? `name=${frame.element.name}` : null,
+              frame.element.src ? `src=${frame.element.src}` : null,
+            ].filter(Boolean).join(" | ")
+          : "";
+        console.log(`${frame.isMain ? "*" : " "} [${frame.index}] ${frame.name || "(no name)"} | ${frame.url}${element ? ` | ${element}` : ""}`);
       }
       process.exit(0);
     }

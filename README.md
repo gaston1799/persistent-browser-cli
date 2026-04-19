@@ -238,6 +238,8 @@ pbc tab inspect active
 pbc tab inspect active --frame gmail
 ```
 
+`--frame` matches Playwright frame names and URLs first, then falls back to the parent DOM iframe element's `id`, `name`, `src`, `title`, and `aria-label`. This helps with cross-origin frames that appear blank in raw frame metadata.
+
 Drive the already-open persistent Chrome tab directly over CDP:
 
 ```powershell

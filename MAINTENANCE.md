@@ -154,6 +154,7 @@ Use this before pushing user-facing features:
 - Profile lock: another Chrome process is using the same user-data directory.
 - Missing refs: run `pbc tab snapshot active` again after navigation or DOM changes.
 - Internal tab selected: use `pbc tab list` and target the visible tab id explicitly.
+- Iframe not found: check `pbc tab frames active`; `--frame` should also match DOM iframe `id`, `name`, and `src`.
 - PowerShell `cli` collision: use `pbc` or `pbc-cli`, not `cli`.
 - Spaces in profile path: keep `--user-data-dir` quoted in `open_persistent_chrome.ps1`.
 - Installer confusion: verify both `pbc.exe` and `setup.exe` are present in the release and called out separately in notes.

@@ -218,22 +218,21 @@ async function reuseOrOpenTab(port, url, options = {}) {
 
 async function listFrames(port, token) {
   return withResolvedTab(port, token, async (tab) => {
-    return tab.page.frames().map((frame, index) => ({
-      index,
-      name: frame.name() || "",
-      url: frame.url(),
-      isMain: frame === tab.page.mainFrame(),
-    }));
+    return Promise.all(
+      tab.page.frames().map(async (frame, index) => ({
+        index,
+        name: frame.name() || "",
+        url: frame.url(),
+        isMain: frame === tab.page.mainFrame(),
+        element: await frameElementInfo(frame),
+      }))
+    );
   });
 }
 
 async function inspectFields(port, token, options = {}) {
-  const frameNeedle = String(options.frame || "").trim().toLowerCase();
   return withResolvedTab(port, token, async (tab) => {
-    const frames = tab.page.frames();
-    const frame = frameNeedle
-      ? frames.find((item) => (item.name() || "").toLowerCase().includes(frameNeedle) || item.url().toLowerCase().includes(frameNeedle))
-      : tab.page.mainFrame();
+    const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
     const controls = await frame.evaluate(() => {
@@ -293,16 +292,83 @@ async function inspectFields(port, token, options = {}) {
   });
 }
 
-function resolveFrame(page, frameNeedle) {
+function normalizeFrameNeedle(frameNeedle) {
   const needle = String(frameNeedle || "").trim().toLowerCase();
+  return needle;
+}
+
+function frameMetadataMatches(frame, needle) {
+  return (
+    (frame.name() || "").toLowerCase().includes(needle) ||
+    frame.url().toLowerCase().includes(needle)
+  );
+}
+
+function iframeInfoMatches(info, needle) {
+  if (!info) return false;
+  return ["id", "name", "src", "title", "ariaLabel"]
+    .map((key) => String(info[key] || "").toLowerCase())
+    .some((value) => value.includes(needle));
+}
+
+async function frameElementInfo(frame) {
+  try {
+    const element = await frame.frameElement();
+    return await element.evaluate((node) => ({
+      id: node.id || "",
+      name: node.getAttribute("name") || "",
+      src: node.getAttribute("src") || "",
+      title: node.getAttribute("title") || "",
+      ariaLabel: node.getAttribute("aria-label") || "",
+    }));
+  } catch {
+    return null;
+  }
+}
+
+async function resolveFrame(page, frameNeedle) {
+  const needle = normalizeFrameNeedle(frameNeedle);
   if (!needle) return page.mainFrame();
 
-  return page.frames().find((frame) => {
-    return (
-      (frame.name() || "").toLowerCase().includes(needle) ||
-      frame.url().toLowerCase().includes(needle)
-    );
-  });
+  const metadataMatch = page.frames().find((frame) => frameMetadataMatches(frame, needle));
+  if (metadataMatch) return metadataMatch;
+
+  for (const frame of page.frames()) {
+    if (frame === page.mainFrame()) continue;
+    if (iframeInfoMatches(await frameElementInfo(frame), needle)) return frame;
+  }
+
+  const iframeMatch = await page
+    .locator("iframe, frame")
+    .evaluateAll((nodes, rawNeedle) => {
+      const needleText = String(rawNeedle || "").toLowerCase();
+      const matches = [];
+      for (let index = 0; index < nodes.length; index += 1) {
+        const node = nodes[index];
+        const info = {
+          index,
+          id: node.id || "",
+          name: node.getAttribute("name") || "",
+          src: node.getAttribute("src") || "",
+          title: node.getAttribute("title") || "",
+          ariaLabel: node.getAttribute("aria-label") || "",
+        };
+        const values = [info.id, info.name, info.src, info.title, info.ariaLabel].map((value) => String(value || "").toLowerCase());
+        if (values.some((value) => value.includes(needleText))) matches.push(info);
+      }
+      return matches[0] || null;
+    }, needle)
+    .catch(() => null);
+
+  if (iframeMatch) {
+    const handle = await page.locator("iframe, frame").nth(iframeMatch.index).elementHandle();
+    const frame = await handle?.contentFrame();
+    await handle?.dispose().catch(() => {});
+    if (frame) return frame;
+    throw new Error(`Found iframe matching "${frameNeedle}", but it does not have an attached content frame yet.`);
+  }
+
+  return null;
 }
 
 function looksLikeSelector(target) {
@@ -311,7 +377,7 @@ function looksLikeSelector(target) {
 
 async function snapshotTab(port, token, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
-    const frame = resolveFrame(tab.page, options.frame);
+    const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
     const items = await frame.evaluate(() => {
@@ -400,7 +466,7 @@ async function snapshotTab(port, token, options = {}) {
 
 async function textTab(port, token, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
-    const frame = resolveFrame(tab.page, options.frame);
+    const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
     const text = await frame.evaluate(() => {
@@ -418,7 +484,7 @@ async function textTab(port, token, options = {}) {
 
 async function clickTab(port, token, target, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
-    const frame = resolveFrame(tab.page, options.frame);
+    const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
     const raw = String(target || "").trim();
@@ -460,7 +526,7 @@ async function fillLocator(locator, value) {
 
 async function fillTab(port, token, target, value, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
-    const frame = resolveFrame(tab.page, options.frame);
+    const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
     const raw = String(target || "").trim();
@@ -496,7 +562,7 @@ async function screenshotTab(port, token, outputPath, options = {}) {
 
 async function evalTab(port, token, source, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
-    const frame = resolveFrame(tab.page, options.frame);
+    const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
     const value = await frame.evaluate(async (script) => {
