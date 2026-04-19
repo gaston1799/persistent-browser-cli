@@ -84,8 +84,18 @@ function resolveTab(tabs, token) {
 
   const byId = raw.replace(/^tab:/i, "").replace(/^p/i, "");
   if (/^\d+$/.test(byId)) {
-    const found = tabs.find((tab) => tab.id === byId);
-    if (found) return found;
+    const visibleTabs = tabs.filter((tab) => !isInternalTab(tab));
+    const visibleByPosition = visibleTabs.find((_, index) => String(index) === byId);
+    if (visibleByPosition) return visibleByPosition;
+
+    const visibleByRawId = visibleTabs.find((tab) => tab.id === byId);
+    if (visibleByRawId) return visibleByRawId;
+
+    const rawByPosition = tabs.find((_, index) => String(index) === byId);
+    if (rawByPosition) return rawByPosition;
+
+    const rawById = tabs.find((tab) => tab.id === byId);
+    if (rawById) return rawById;
   }
 
   const needle = raw.toLowerCase();

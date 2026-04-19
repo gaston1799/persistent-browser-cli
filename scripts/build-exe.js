@@ -52,6 +52,9 @@ async function main() {
     format: "cjs",
     target: ["node23"],
     legalComments: "none",
+    define: {
+      "process.env.PBC_VERSION": JSON.stringify(JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version),
+    },
     banner: {
       js: "const { createRequire } = require('node:module');\nrequire = createRequire(__filename);",
     },

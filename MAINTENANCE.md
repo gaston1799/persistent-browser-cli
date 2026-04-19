@@ -107,6 +107,14 @@ npm run build:exe
 gh release upload vX.Y.Z .\dist\pbc.exe
 ```
 
+## Update Flow
+
+- `pbc` should print a non-blocking notice when GitHub Releases has a newer tag.
+- `pbc update --check-only` should only report status.
+- `pbc update` should update the current git checkout with `git fetch --tags --prune` and `git pull --ff-only`, then reinstall npm dependencies.
+- `install.ps1` is the user-local bootstrap path for fresh installs.
+- Keep `PBC_SKIP_UPDATE_CHECK=1` available for automation and offline use.
+
 ## Design Rules
 
 - Prefer CDP-native `pbc tab ...` commands for logged-in persistent Chrome work.
@@ -115,6 +123,7 @@ gh release upload vX.Y.Z .\dist\pbc.exe
 - Never commit `config.local.json`, profile data, screenshots, logs, or private automation data.
 - Keep machine-specific paths in `config.local.json` or environment variables.
 - Avoid site-specific automation in this repo. This is reusable browser tooling, not a job-search script repo.
+- Treat `pbc update` as a git-checkout updater, not a Windows system installer.
 
 ## Testing Checklist
 

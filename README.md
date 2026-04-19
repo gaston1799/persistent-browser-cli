@@ -10,6 +10,7 @@ This repo is the reusable subset of the custom browser tooling:
 - back up the persistent profile
 - shut the browser down cleanly with `Browser.close`
 - forward normal Playwright CLI commands when you intentionally want a separate Playwright CLI session
+- check GitHub Releases for updates and pull the latest tagged release into a git checkout
 
 ## Scope
 
@@ -60,6 +61,20 @@ cli sac
 ```
 
 `cli` is convenient, but on PowerShell it collides with the built-in `Clear-Item` alias. In practice you should use `pbc` or `pbc-cli`.
+
+For a user-local install that also verifies the environment:
+
+```powershell
+.\install.ps1 -LinkGlobal
+```
+
+Optional stable-profile clone flow:
+
+```powershell
+.\install.ps1 -LinkGlobal -CloneStableChromeProfile
+```
+
+That script clones the repo into `%LOCALAPPDATA%\persistent-browser-cli`, runs `npm install`, links the command globally if requested, and checks `pbc doctor`.
 
 ## Windows EXE Build
 
@@ -158,6 +173,20 @@ pbc doctor
 ```
 
 This verifies the effective Chrome path, profile path, backup path, command shims, and whether the configured CDP endpoint is reachable.
+
+Check for updates:
+
+```powershell
+pbc update --check-only
+```
+
+Pull the latest tagged release into this git checkout:
+
+```powershell
+pbc update
+```
+
+On startup, `pbc` prints a non-blocking update notice if GitHub Releases reports a newer tag. Set `PBC_SKIP_UPDATE_CHECK=1` to disable that check for scripts or offline use.
 
 List and reuse tabs:
 
@@ -286,3 +315,4 @@ Use `pbc pw` only when you intentionally want the external Playwright CLI workfl
 - Using multiple tabs in the same browser is fine.
 - The PowerShell launch/backup scripts are Windows-specific by design.
 - For PATH-based everyday use, `npm link` plus `pbc` / `pbc-cli` is still the cleaner workflow than calling the built EXE directly.
+- `pbc update` expects a git checkout. If you installed only from a binary asset, use the installer again or replace the binary with the newest release asset.

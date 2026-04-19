@@ -14,6 +14,10 @@ const {
   BACKUP_ROOT,
 } = require("./config");
 const {
+  checkForUpdate,
+  installRepo,
+} = require("./update");
+const {
   activateTab,
   clickTab,
   closeTab,
@@ -32,6 +36,8 @@ const {
 } = require("./tab_tools");
 
 const ROOT = __dirname;
+const SELF_REPO = process.env.PBC_GITHUB_REPO || "gaston1799/persistent-browser-cli";
+const PBC_VERSION = process.env.PBC_VERSION || "0.0.0";
 let seaApi = null;
 
 try {
@@ -49,6 +55,7 @@ Usage:
   pbc saveandclose [--port 9222]
   pbc sac [--port 9222]
   pbc backup [--kill]
+  pbc update [--check-only] [--port 9222]
 
   pbc tab list [--all] [--port 9222]
   pbc tab activate <id|match> [--port 9222]
@@ -72,6 +79,8 @@ Environment overrides:
   PBC_BACKUP_ROOT
   PBC_CDP_PORT
   PBC_PWCLI_SESSION
+  PBC_GITHUB_REPO
+  PBC_SKIP_UPDATE_CHECK
 
 Defaults:
   chromeExe:   ${CHROME_EXE}
@@ -175,6 +184,72 @@ function runPwsh(ps1, args = []) {
   process.exit(result.status ?? 1);
 }
 
+function currentVersion() {
+  if (PBC_VERSION && PBC_VERSION !== "0.0.0") {
+    return PBC_VERSION;
+  }
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+    return String(pkg.version || "0.0.0");
+  } catch {
+    return "0.0.0";
+  }
+}
+
+async function maybePrintUpdateNotice() {
+  if (process.env.PBC_SKIP_UPDATE_CHECK) return;
+  try {
+    const info = await checkForUpdate({ repoFullName: SELF_REPO, currentVersion: currentVersion() });
+    if (info.updateAvailable) {
+      console.log(`[pbc] Update available: v${info.currentVersion} -> v${info.latestVersion}`);
+      console.log(`[pbc] Run \`pbc update\` to install the latest release.`);
+    }
+  } catch {
+    // Non-blocking by design.
+  }
+}
+
+async function updateSelf(checkOnly = false) {
+  const info = await checkForUpdate({ repoFullName: SELF_REPO, currentVersion: currentVersion() });
+  console.log(`[pbc] Current version: v${info.currentVersion}`);
+  console.log(`[pbc] Latest release:  ${info.latestTag || `v${info.latestVersion}`}`);
+  if (!info.releaseUrl) {
+    console.log("[pbc] Could not determine the latest release URL.");
+  } else {
+    console.log(`[pbc] Release URL:     ${info.releaseUrl}`);
+  }
+
+  if (!info.updateAvailable) {
+    console.log("[pbc] Already up to date.");
+    return 0;
+  }
+
+  if (checkOnly) {
+    console.log("[pbc] Update available, but no changes were made because --check-only was set.");
+    return 0;
+  }
+
+  const gitResult = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if ((gitResult.status ?? 1) !== 0) {
+    console.log("[pbc] This install is not a git checkout. Use the release asset or rerun the installer in a cloned repo.");
+    return 1;
+  }
+
+  console.log("[pbc] Pulling the latest tagged release into this checkout...");
+  const status = installRepo({ repoDir: ROOT });
+  if (status !== 0) {
+    console.log(`[pbc] Update failed with exit code ${status}.`);
+    return status;
+  }
+
+  console.log("[pbc] Update complete.");
+  return 0;
+}
+
 function isSeaRuntime() {
   return Boolean(seaApi && typeof seaApi.isSea === "function" && seaApi.isSea());
 }
@@ -265,6 +340,8 @@ async function main() {
   const argv = process.argv.slice(2);
   if (argv.length === 0) usage(0);
   if (argv[0] === "-h" || argv[0] === "--help") usage(0);
+
+  await maybePrintUpdateNotice();
 
   const cmd = argv[0];
 
@@ -413,6 +490,12 @@ async function main() {
       ...(kill ? ["-KillChrome"] : []),
     ]);
     return;
+  }
+
+  if (cmd === "update") {
+    const checkOnly = hasFlag("--check-only", argv);
+    const status = await updateSelf(checkOnly);
+    process.exit(status);
   }
 
   if (cmd === "tab") {
