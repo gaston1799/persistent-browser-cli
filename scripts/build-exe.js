@@ -35,63 +35,85 @@ async function main() {
   const root = path.resolve(__dirname, "..");
   const buildDir = path.join(root, "build");
   const distDir = path.join(root, "dist");
-  const bundlePath = path.join(buildDir, "sea-entry.cjs");
-  const configPath = path.join(buildDir, "sea-config.json");
-  const blobPath = path.join(buildDir, "sea-prep.blob");
-  const outputExe = path.join(distDir, "pbc.exe");
+  const version = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version;
 
   fs.mkdirSync(buildDir, { recursive: true });
   fs.mkdirSync(distDir, { recursive: true });
 
-  await esbuild.build({
-    entryPoints: [path.join(root, "cli.js")],
-    outfile: bundlePath,
-    bundle: true,
-    external: ["playwright-core"],
-    platform: "node",
-    format: "cjs",
-    target: ["node23"],
-    legalComments: "none",
-    define: {
-      "process.env.PBC_VERSION": JSON.stringify(JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")).version),
-    },
-    banner: {
-      js: "const { createRequire } = require('node:module');\nrequire = createRequire(__filename);",
-    },
-  });
+  async function buildSea({ entryFile, outputName, assets = {} }) {
+    const bundlePath = path.join(buildDir, `${outputName}.cjs`);
+    const configPath = path.join(buildDir, `${outputName}.json`);
+    const blobPath = path.join(buildDir, `${outputName}.blob`);
+    const outputExe = path.join(distDir, `${outputName}.exe`);
 
-  const seaConfig = {
-    main: bundlePath,
-    output: blobPath,
-    mainFormat: "commonjs",
-    disableExperimentalSEAWarning: true,
-    useSnapshot: false,
-    useCodeCache: false,
-    execArgvExtension: "none",
+    await esbuild.build({
+      entryPoints: [entryFile],
+      outfile: bundlePath,
+      bundle: true,
+      external: ["playwright-core"],
+      platform: "node",
+      format: "cjs",
+      target: ["node23"],
+      legalComments: "none",
+      define: {
+        "process.env.PBC_VERSION": JSON.stringify(version),
+      },
+      banner: {
+        js: "const { createRequire } = require('node:module');\nrequire = createRequire(__filename);",
+      },
+    });
+
+    const seaConfig = {
+      main: bundlePath,
+      output: blobPath,
+      mainFormat: "commonjs",
+      disableExperimentalSEAWarning: true,
+      useSnapshot: false,
+      useCodeCache: false,
+      execArgvExtension: "none",
+      assets,
+    };
+
+    fs.writeFileSync(configPath, `${JSON.stringify(seaConfig, null, 2)}\n`);
+    if (fs.existsSync(blobPath)) fs.rmSync(blobPath, { force: true });
+    if (fs.existsSync(outputExe)) fs.rmSync(outputExe, { force: true });
+
+    run(process.execPath, ["--experimental-sea-config", configPath], { cwd: root });
+    fs.copyFileSync(process.execPath, outputExe);
+
+    const postjectCli = path.join(root, "node_modules", "postject", "dist", "cli.js");
+    runAllowWarning(process.execPath, [postjectCli, outputExe, "NODE_SEA_BLOB", blobPath, "--sentinel-fuse", SENTINEL_FUSE], {
+      cwd: root,
+    });
+
+    if (!fs.existsSync(outputExe)) {
+      console.error(`[pbc] SEA build completed without producing ${outputExe}`);
+      process.exit(1);
+    }
+
+    return outputExe;
+  }
+
+  const pbcExe = await buildSea({
+    entryFile: path.join(root, "cli.js"),
+    outputName: "pbc",
     assets: {
       "open_persistent_chrome.ps1": path.join(root, "open_persistent_chrome.ps1"),
       "backup_profile.ps1": path.join(root, "backup_profile.ps1"),
+      "install.ps1": path.join(root, "install.ps1"),
     },
-  };
-
-  fs.writeFileSync(configPath, `${JSON.stringify(seaConfig, null, 2)}\n`);
-  if (fs.existsSync(blobPath)) fs.rmSync(blobPath, { force: true });
-  if (fs.existsSync(outputExe)) fs.rmSync(outputExe, { force: true });
-
-  run(process.execPath, ["--experimental-sea-config", configPath], { cwd: root });
-  fs.copyFileSync(process.execPath, outputExe);
-
-  const postjectCli = path.join(root, "node_modules", "postject", "dist", "cli.js");
-  runAllowWarning(process.execPath, [postjectCli, outputExe, "NODE_SEA_BLOB", blobPath, "--sentinel-fuse", SENTINEL_FUSE], {
-    cwd: root,
   });
 
-  if (!fs.existsSync(outputExe)) {
-    console.error(`[pbc] SEA build completed without producing ${outputExe}`);
-    process.exit(1);
-  }
+  const setupExe = await buildSea({
+    entryFile: path.join(root, "setup.js"),
+    outputName: "setup",
+    assets: {
+      "install.ps1": path.join(root, "install.ps1"),
+    },
+  });
 
-  console.log(`[pbc] Built ${outputExe}`);
+  console.log(`[pbc] Built ${pbcExe}`);
+  console.log(`[pbc] Built ${setupExe}`);
 }
 
 main().catch((error) => {

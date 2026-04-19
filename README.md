@@ -74,6 +74,12 @@ Or from the CLI:
 pbc install --link-global
 ```
 
+Or with the bootstrapper:
+
+```powershell
+.\dist\setup.exe --link-global
+```
+
 Optional stable-profile clone flow:
 
 ```powershell
@@ -84,6 +90,12 @@ Or from the CLI:
 
 ```powershell
 pbc install --link-global --clone-stable-chrome-profile
+```
+
+Or with the bootstrapper:
+
+```powershell
+.\dist\setup.exe --link-global --clone-stable-chrome-profile
 ```
 
 That script clones the repo into `%LOCALAPPDATA%\persistent-browser-cli`, runs `npm install`, links the command globally if requested, and checks `pbc doctor`.
@@ -101,6 +113,7 @@ That writes:
 
 ```powershell
 dist\pbc.exe
+dist\setup.exe
 ```
 
 Example:
@@ -108,15 +121,19 @@ Example:
 ```powershell
 .\dist\pbc.exe --help
 .\dist\pbc.exe doctor
+.\dist\setup.exe --help
 ```
 
 Important constraints:
 
-- The EXE is a repo-local convenience binary, not a fully standalone packaged app.
+- `pbc.exe` is the runtime CLI.
+- `setup.exe` is the installer/bootstrapper.
+- Neither EXE is a fully standalone packaged app.
 - It still expects the repo's installed dependencies to exist, so run `npm install` first.
 - In practice, `dist\pbc.exe` resolves `playwright-core` from the repo's `node_modules` directory.
 - The build process uses Node's single-executable application workflow plus `postject` on Node versions that do not yet support `--build-sea` directly.
 - On Windows, the build may print a signature warning after injection. That is expected for a local unsigned build.
+- `setup.exe` downloads a portable Node.js LTS build into the user profile if Node is missing, refreshes PATH, and then runs the repo bootstrap flow.
 
 ## Persistent Profile Setup
 

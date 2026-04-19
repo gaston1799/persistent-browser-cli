@@ -114,6 +114,7 @@ gh release upload vX.Y.Z .\dist\pbc.exe
 - `pbc update` should update the current git checkout with `git fetch --tags --prune` and `git pull --ff-only`, then reinstall npm dependencies.
 - `install.ps1` is the user-local bootstrap path for fresh installs.
 - `pbc install` should be the user-facing wrapper around `install.ps1`.
+- `setup.exe` should be the user-facing double-click installer that bootstraps Node and then runs `install.ps1`.
 - Keep `PBC_SKIP_UPDATE_CHECK=1` available for automation and offline use.
 
 ## Design Rules
@@ -137,6 +138,7 @@ Use this before pushing user-facing features:
 - `npm run build:exe`
 - `.\dist\pbc.exe --help`
 - `.\dist\pbc.exe doctor`
+- `.\dist\setup.exe --help`
 - temporary-profile launch with a path containing spaces
 - `pbc tab list`
 - `pbc tab snapshot`
@@ -154,6 +156,7 @@ Use this before pushing user-facing features:
 - Internal tab selected: use `pbc tab list` and target the visible tab id explicitly.
 - PowerShell `cli` collision: use `pbc` or `pbc-cli`, not `cli`.
 - Spaces in profile path: keep `--user-data-dir` quoted in `open_persistent_chrome.ps1`.
+- Installer confusion: verify both `pbc.exe` and `setup.exe` are present in the release and called out separately in notes.
 
 ## Commit Standard
 
