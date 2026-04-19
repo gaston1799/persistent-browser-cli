@@ -113,6 +113,7 @@ gh release upload vX.Y.Z .\dist\pbc.exe
 - `pbc update --check-only` should only report status.
 - `pbc update` should update the current git checkout with `git fetch --tags --prune` and `git pull --ff-only`, then reinstall npm dependencies.
 - `install.ps1` is the user-local bootstrap path for fresh installs.
+- `pbc install` should be the user-facing wrapper around `install.ps1`.
 - Keep `PBC_SKIP_UPDATE_CHECK=1` available for automation and offline use.
 
 ## Design Rules

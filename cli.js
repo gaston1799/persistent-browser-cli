@@ -56,6 +56,7 @@ Usage:
   pbc sac [--port 9222]
   pbc backup [--kill]
   pbc update [--check-only] [--port 9222]
+  pbc install [--repo-url <url>] [--install-root <path>] [--link-global] [--clone-stable-chrome-profile]
 
   pbc tab list [--all] [--port 9222]
   pbc tab activate <id|match> [--port 9222]
@@ -120,6 +121,11 @@ function positionalArgs(argv) {
     result.push(value);
   }
   return result;
+}
+
+function readOption(flag, argv, defaultValue = null) {
+  const value = readArg(flag, argv);
+  return value == null ? defaultValue : value;
 }
 
 function formatStatus(ok, label, detail) {
@@ -489,6 +495,25 @@ async function main() {
       BACKUP_ROOT,
       ...(kill ? ["-KillChrome"] : []),
     ]);
+    return;
+  }
+
+  if (cmd === "install") {
+    if (argv.includes("-h") || argv.includes("--help")) {
+      console.log("Usage: pbc install [--repo-url <url>] [--install-root <path>] [--link-global] [--clone-stable-chrome-profile]");
+      process.exit(0);
+    }
+    const repoUrl = readOption("--repo-url", argv, "https://github.com/gaston1799/persistent-browser-cli.git");
+    const installRoot = readOption("--install-root", argv, path.join(os.homedir(), "AppData", "Local", "persistent-browser-cli"));
+    const args = [
+      "-RepoUrl",
+      repoUrl,
+      "-InstallRoot",
+      installRoot,
+    ];
+    if (hasFlag("--link-global", argv)) args.push("-LinkGlobal");
+    if (hasFlag("--clone-stable-chrome-profile", argv)) args.push("-CloneStableChromeProfile");
+    runPwsh("install.ps1", args);
     return;
   }
 

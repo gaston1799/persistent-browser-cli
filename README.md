@@ -68,10 +68,22 @@ For a user-local install that also verifies the environment:
 .\install.ps1 -LinkGlobal
 ```
 
+Or from the CLI:
+
+```powershell
+pbc install --link-global
+```
+
 Optional stable-profile clone flow:
 
 ```powershell
 .\install.ps1 -LinkGlobal -CloneStableChromeProfile
+```
+
+Or from the CLI:
+
+```powershell
+pbc install --link-global --clone-stable-chrome-profile
 ```
 
 That script clones the repo into `%LOCALAPPDATA%\persistent-browser-cli`, runs `npm install`, links the command globally if requested, and checks `pbc doctor`.
@@ -316,3 +328,4 @@ Use `pbc pw` only when you intentionally want the external Playwright CLI workfl
 - The PowerShell launch/backup scripts are Windows-specific by design.
 - For PATH-based everyday use, `npm link` plus `pbc` / `pbc-cli` is still the cleaner workflow than calling the built EXE directly.
 - `pbc update` expects a git checkout. If you installed only from a binary asset, use the installer again or replace the binary with the newest release asset.
+- `pbc install` is the preferred first-run bootstrap command when you want one command that clones the repo, installs dependencies, and links `pbc` onto PATH.
