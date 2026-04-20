@@ -79,6 +79,7 @@ Environment overrides:
   PBC_USER_DATA_DIR
   PBC_BACKUP_ROOT
   PBC_CDP_PORT
+  PBC_OPEN_TIMEOUT_MS
   PBC_PWCLI_SESSION
   PBC_GITHUB_REPO
   PBC_SKIP_UPDATE_CHECK
@@ -175,11 +176,55 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForCdp(port, timeoutMs = 15000) {
+function normalizeTargetUrl(value) {
+  try {
+    const url = new URL(value);
+    url.hash = "";
+    if (url.pathname !== "/" && url.pathname.endsWith("/")) {
+      url.pathname = url.pathname.replace(/\/+$/, "");
+    }
+    return url.toString();
+  } catch {
+    return String(value || "").trim();
+  }
+}
+
+function isChromeSystemUrl(value) {
+  const url = String(value || "").toLowerCase();
+  return (
+    url.startsWith("chrome://") ||
+    url.startsWith("devtools://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("chrome-extension://")
+  );
+}
+
+function targetMatchesOpenUrl(target, requestedUrl) {
+  const targetUrl = String(target?.url || "");
+  if (!targetUrl) return false;
+  if (normalizeTargetUrl(targetUrl) === normalizeTargetUrl(requestedUrl)) return true;
+  return !isChromeSystemUrl(targetUrl);
+}
+
+async function fetchCdpPageTargets(port) {
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+  if (!response.ok) return [];
+  const targets = await response.json();
+  return targets.filter((target) => target.type === "page");
+}
+
+async function waitForOpenReady(port, requestedUrl, timeoutMs = 120000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    if (await isCdpUp(port)) return true;
-    await sleep(250);
+    try {
+      if (await isCdpUp(port)) {
+        const pages = await fetchCdpPageTargets(port);
+        if (pages.some((target) => targetMatchesOpenUrl(target, requestedUrl))) return true;
+      }
+    } catch {
+      // Chrome can accept the version request before the target list is ready.
+    }
+    await sleep(500);
   }
   return false;
 }
@@ -395,9 +440,10 @@ async function main() {
     ]);
     if (launchStatus !== 0) process.exit(launchStatus);
 
-    const ready = await waitForCdp(port);
+    const openTimeoutMs = Number(process.env.PBC_OPEN_TIMEOUT_MS || 120000);
+    const ready = await waitForOpenReady(port, url, openTimeoutMs);
     if (!ready) {
-      console.error(`[pbc] Timed out waiting for CDP to become reachable at http://127.0.0.1:${port}.`);
+      console.error(`[pbc] Timed out waiting for a usable CDP page target at http://127.0.0.1:${port}.`);
       process.exit(2);
     }
 

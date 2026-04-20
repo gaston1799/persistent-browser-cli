@@ -19,6 +19,16 @@ function isInternalTab(tab) {
   );
 }
 
+function isChromeSystemTab(tab) {
+  const url = String(tab?.url || "").toLowerCase();
+  return (
+    url.startsWith("chrome://") ||
+    url.startsWith("devtools://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("chrome-extension://")
+  );
+}
+
 function normalizeUrl(value) {
   try {
     const url = new URL(value);
@@ -75,12 +85,16 @@ function resolveTab(tabs, token) {
     const activeVisible = tabs.find((tab) => tab.active && !isInternalTab(tab));
     if (activeVisible) return activeVisible;
 
-    const activeAny = tabs.find((tab) => tab.active);
-    if (activeAny && !isInternalTab(activeAny)) return activeAny;
-
     const lastVisible = [...tabs].reverse().find((tab) => !isInternalTab(tab));
     if (lastVisible) return lastVisible;
 
+    const activeUserTab = tabs.find((tab) => tab.active && !isChromeSystemTab(tab));
+    if (activeUserTab) return activeUserTab;
+
+    const lastUserTab = [...tabs].reverse().find((tab) => !isChromeSystemTab(tab));
+    if (lastUserTab) return lastUserTab;
+
+    const activeAny = tabs.find((tab) => tab.active);
     return activeAny || tabs[tabs.length - 1];
   }
 
@@ -654,7 +668,8 @@ async function requestBrowserClose(port) {
   try {
     response = await fetch(`http://127.0.0.1:${port}/json/version`);
   } catch (error) {
-    if (String(error?.cause?.code || error?.code || "") === "ECONNREFUSED") {
+    const code = String(error?.cause?.code || error?.code || "");
+    if (code === "ECONNREFUSED" || code === "UND_ERR_SOCKET" || error instanceof TypeError) {
       return { alreadyClosed: true };
     }
     throw error;
@@ -712,13 +727,11 @@ async function requestBrowserClose(port) {
     });
 
     ws.addEventListener("error", () => {
-      if (!sent) finish(new Error("Failed to connect to the CDP websocket."));
-      else finish();
+      finish();
     });
 
     ws.addEventListener("close", () => {
-      if (!sent) finish(new Error("CDP websocket closed before Browser.close was sent."));
-      else finish();
+      finish();
     });
   });
 

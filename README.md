@@ -155,6 +155,7 @@ $env:PBC_CHROME_EXE = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 $env:PBC_USER_DATA_DIR = 'D:\browser-profiles\my-profile'
 $env:PBC_BACKUP_ROOT = 'D:\browser-profiles\backups'
 $env:PBC_CDP_PORT = '9333'
+$env:PBC_OPEN_TIMEOUT_MS = '120000'
 $env:PBC_PWCLI_SESSION = 'my-browser-session'
 ```
 
@@ -189,7 +190,7 @@ pbc open https://mail.google.com
 pbc open https://example.com --reuse
 ```
 
-`pbc open` waits until the CDP endpoint is reachable before returning, so follow-up commands can be chained in the same one-liner.
+`pbc open` polls every 500 ms until CDP exposes a usable page target before returning, so follow-up commands can be chained in the same one-liner. Set `PBC_OPEN_TIMEOUT_MS` if a very slow machine needs more than the default 120 seconds.
 
 Check whether CDP is up:
 
@@ -261,7 +262,7 @@ When changing browser behavior, run a short smoke test and commit visual proof w
 
 ```powershell
 pbc open about:blank
-pbc tab eval active 'document.body.innerHTML = "<label>Name <input aria-label=''Name''></label><button id=''go'' onclick=''document.querySelector(\"#out\").textContent=document.querySelector(\"input\").value''>Go</button><div id=''out''></div>"; "ready"'
+pbc tab eval active 'document.body.innerHTML = `<label>Name <input aria-label="Name"></label><button id="go" onclick="document.querySelector(''#out'').textContent=document.querySelector(''input'').value">Go</button><div id="out"></div>`; "ready"'
 pbc tab snapshot active
 pbc tab fill active e0 Gaston
 pbc tab click active e1
