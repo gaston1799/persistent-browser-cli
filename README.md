@@ -189,6 +189,8 @@ pbc open https://mail.google.com
 pbc open https://example.com --reuse
 ```
 
+`pbc open` waits until the CDP endpoint is reachable before returning, so follow-up commands can be chained in the same one-liner.
+
 Check whether CDP is up:
 
 ```powershell

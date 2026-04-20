@@ -171,6 +171,19 @@ async function isCdpUp(port) {
   });
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForCdp(port, timeoutMs = 15000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (await isCdpUp(port)) return true;
+    await sleep(250);
+  }
+  return false;
+}
+
 async function countCdpPageTargets(port) {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`);
   if (!response.ok) {
@@ -187,7 +200,7 @@ function runPwsh(ps1, args = []) {
     ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, ...args],
     { stdio: "inherit", cwd: ROOT }
   );
-  process.exit(result.status ?? 1);
+  return result.status ?? 1;
 }
 
 function currentVersion() {
@@ -370,7 +383,7 @@ async function main() {
       }
     }
 
-    runPwsh("open_persistent_chrome.ps1", [
+    const launchStatus = runPwsh("open_persistent_chrome.ps1", [
       "-Url",
       url,
       "-RemoteDebuggingPort",
@@ -380,7 +393,16 @@ async function main() {
       "-UserDataDir",
       USER_DATA_DIR,
     ]);
-    return;
+    if (launchStatus !== 0) process.exit(launchStatus);
+
+    const ready = await waitForCdp(port);
+    if (!ready) {
+      console.error(`[pbc] Timed out waiting for CDP to become reachable at http://127.0.0.1:${port}.`);
+      process.exit(2);
+    }
+
+    console.log(`CDP: UP (http://127.0.0.1:${port})`);
+    process.exit(0);
   }
 
   if (cmd === "cdp") {
@@ -488,14 +510,13 @@ async function main() {
 
   if (cmd === "backup") {
     const kill = hasFlag("--kill", argv);
-    runPwsh("backup_profile.ps1", [
+    process.exit(runPwsh("backup_profile.ps1", [
       "-SourceDir",
       USER_DATA_DIR,
       "-BackupRoot",
       BACKUP_ROOT,
       ...(kill ? ["-KillChrome"] : []),
-    ]);
-    return;
+    ]));
   }
 
   if (cmd === "install") {
@@ -513,8 +534,7 @@ async function main() {
     ];
     if (hasFlag("--link-global", argv)) args.push("-LinkGlobal");
     if (hasFlag("--clone-stable-chrome-profile", argv)) args.push("-CloneStableChromeProfile");
-    runPwsh("install.ps1", args);
-    return;
+    process.exit(runPwsh("install.ps1", args));
   }
 
   if (cmd === "update") {
