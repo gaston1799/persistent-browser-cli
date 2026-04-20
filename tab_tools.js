@@ -1,3 +1,5 @@
+const fs = require("node:fs");
+const path = require("node:path");
 const { chromium } = require("playwright-core");
 
 function formatTabLabel(tab) {
@@ -375,6 +377,51 @@ function looksLikeSelector(target) {
   return /^[.#\[]/.test(target) || /^(input|textarea|select|button|a|label|form|div|span)\b/i.test(target) || /^\/\//.test(target);
 }
 
+async function ensureUsableViewport(page) {
+  const viewport = await page
+    .evaluate(() => ({
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      visualWidth: window.visualViewport?.width || 0,
+      visualHeight: window.visualViewport?.height || 0,
+    }))
+    .catch(() => null);
+
+  if (
+    viewport &&
+    viewport.innerWidth >= 100 &&
+    viewport.innerHeight >= 100 &&
+    viewport.visualWidth >= 100 &&
+    viewport.visualHeight >= 100
+  ) {
+    return;
+  }
+
+  await page.setViewportSize({ width: 1280, height: 900 }).catch(() => {});
+
+  const session = await page.context().newCDPSession(page);
+  try {
+    const { windowId } = await session.send("Browser.getWindowForTarget");
+    await session.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "normal", left: 40, top: 40, width: 1280, height: 900 },
+    });
+    await page.waitForTimeout(250);
+  } catch {
+    await session
+      .send("Emulation.setDeviceMetricsOverride", {
+        width: 1280,
+        height: 900,
+        deviceScaleFactor: 1,
+        mobile: false,
+      })
+      .catch(() => {});
+    await page.waitForTimeout(250);
+  } finally {
+    await session.detach().catch(() => {});
+  }
+}
+
 async function snapshotTab(port, token, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
     const frame = await resolveFrame(tab.page, options.frame);
@@ -484,6 +531,8 @@ async function textTab(port, token, options = {}) {
 
 async function clickTab(port, token, target, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
@@ -526,6 +575,8 @@ async function fillLocator(locator, value) {
 
 async function fillTab(port, token, target, value, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
@@ -555,7 +606,23 @@ async function fillTab(port, token, target, value, options = {}) {
 
 async function screenshotTab(port, token, outputPath, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
-    await tab.page.screenshot({ path: outputPath, fullPage: Boolean(options.fullPage) });
+    await ensureUsableViewport(tab.page);
+    try {
+      await tab.page.screenshot({ path: outputPath, fullPage: Boolean(options.fullPage), timeout: 10000 });
+    } catch {
+      const session = await tab.page.context().newCDPSession(tab.page);
+      try {
+        const image = await session.send("Page.captureScreenshot", {
+          format: "png",
+          fromSurface: true,
+          captureBeyondViewport: Boolean(options.fullPage),
+        });
+        fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+        fs.writeFileSync(outputPath, Buffer.from(image.data, "base64"));
+      } finally {
+        await session.detach().catch(() => {});
+      }
+    }
     return { path: outputPath, url: tab.page.url() };
   });
 }

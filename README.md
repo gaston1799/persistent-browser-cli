@@ -246,12 +246,41 @@ Drive the already-open persistent Chrome tab directly over CDP:
 pbc tab snapshot active
 pbc tab text active
 pbc tab click active e3
-pbc tab fill active e7 "naquan@example.com"
+pbc tab fill active e7 "gaston@example.com"
 pbc tab screenshot active .\output\page.png
 pbc tab eval active "document.title"
 ```
 
 These commands attach to the Chrome instance started by `pbc open`, so they use the same logged-in persistent profile and the same tabs. They do not go through `pbc pw`.
+
+## Smoke Test Proof
+
+When changing browser behavior, run a short smoke test and commit visual proof when the check produces a screenshot.
+
+```powershell
+pbc open about:blank
+pbc tab eval active 'document.body.innerHTML = "<label>Name <input aria-label=''Name''></label><button id=''go'' onclick=''document.querySelector(\"#out\").textContent=document.querySelector(\"input\").value''>Go</button><div id=''out''></div>"; "ready"'
+pbc tab snapshot active
+pbc tab fill active e0 Gaston
+pbc tab click active e1
+pbc tab text active
+pbc tab screenshot active .\photos\pbc-smoke.png
+pbc sac
+```
+
+Expected visual proof:
+
+<img src="https://cdn.jsdelivr.net/gh/gaston1799/persistent-browser-cli@main/photos/pbc-smoke.png" alt="persistent-browser-cli smoke test proof" width="720">
+
+If a smoke check is not visual, paste the terminal output instead. For example:
+
+```text
+CDP: UP (http://127.0.0.1:9223)
+[pbc] Filled ref "e0" using fill.
+[pbc] Clicked ref "e1".
+Name Go
+Gaston
+```
 
 Useful variants:
 

@@ -42,7 +42,7 @@ Remove-Item Env:\PBC_USER_DATA_DIR
 node cli.js open about:blank --port 9944
 node cli.js tab eval active 'document.body.innerHTML = "<input aria-label=\"Name\"><button>Go</button>"; "ready"' --port 9944
 node cli.js tab snapshot active --port 9944
-node cli.js tab fill active e0 Naquan --port 9944
+node cli.js tab fill active e0 Gaston --port 9944
 node cli.js tab click active e1 --port 9944
 node cli.js tab screenshot active .\output\smoke.png --port 9944
 node cli.js sac --port 9944

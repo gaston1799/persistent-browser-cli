@@ -345,7 +345,7 @@ function defaultScreenshotPath() {
 async function main() {
   const argv = process.argv.slice(2);
   if (argv.length === 0) usage(0);
-  if (argv[0] === "-h" || argv[0] === "--help") usage(0);
+  if (argv[0] === "-h" || argv[0] === "-help" || argv[0] === "--help") usage(0);
 
   await maybePrintUpdateNotice();
 
