@@ -142,9 +142,9 @@ By default the CLI uses:
 - Chrome executable:
   `C:\Program Files\Google\Chrome\Application\chrome.exe`
 - persistent profile dir:
-  `%LOCALAPPDATA%\persistent-browser-cli\profiles\default`
+  `%USERPROFILE%\.codex\pbcDataDir\profiles\default`
 - backup dir:
-  `%LOCALAPPDATA%\persistent-browser-cli\backups`
+  `%USERPROFILE%\.codex\pbcDataDir\backups`
 - CDP port:
   `9222`
 
@@ -152,6 +152,7 @@ You can override any of these with environment variables:
 
 ```powershell
 $env:PBC_CHROME_EXE = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+$env:PBC_DATA_ROOT = "$env:USERPROFILE\.codex\pbcDataDir"
 $env:PBC_USER_DATA_DIR = 'D:\browser-profiles\my-profile'
 $env:PBC_BACKUP_ROOT = 'D:\browser-profiles\backups'
 $env:PBC_CDP_PORT = '9333'
@@ -178,6 +179,21 @@ Open Chrome with the persistent profile:
 cd persistent-browser-cli
 node cli.js open https://mail.google.com
 ```
+
+If the default Codex profile directory does not exist, `pbc open` prompts you to clone an installed Chrome channel profile or create an empty profile. The clone target is stable across runs: `%USERPROFILE%\.codex\pbcDataDir\profiles\default`.
+
+Use flags to avoid the prompt:
+
+```powershell
+pbc open https://mail.google.com --profile-source stable
+pbc open https://mail.google.com --profile-source beta
+pbc open https://mail.google.com --profile-source dev
+pbc open https://mail.google.com --profile-source canary
+pbc open https://mail.google.com --profile-source empty
+pbc open https://mail.google.com --profile-source "D:\Chrome\User Data"
+```
+
+Close Chrome before cloning from an existing Chrome profile. Use `--no-profile-clone` to create an empty default profile without prompting.
 
 Log in normally in that Chrome window. When Chrome is closed cleanly, the login state remains in the profile directory.
 
@@ -255,6 +271,24 @@ pbc tab eval active "document.title"
 ```
 
 These commands attach to the Chrome instance started by `pbc open`, so they use the same logged-in persistent profile and the same tabs. They do not go through `pbc pw`.
+
+Trace a tab command when debugging browser automation:
+
+```powershell
+pbc tab click active e3 --trace
+pbc tab fill active e7 "gaston@example.com" --trace
+pbc tab eval active "document.title" --trace
+pbc trace latest
+pbc trace list
+```
+
+`--trace` writes a debugging bundle under `output\pbc-traces\...` by default. Each bundle includes `trace.json`, before/after screenshots, before/after page text, and after-command snapshots. The before capture intentionally skips a fresh snapshot so ref-based commands keep using the refs from your latest explicit `pbc tab snapshot`.
+
+Use `--trace-dir <path>` to choose an output folder:
+
+```powershell
+pbc tab click active e3 --trace --trace-dir .\output\my-trace
+```
 
 ## Smoke Test Proof
 

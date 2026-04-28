@@ -5,12 +5,15 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const readline = require("node:readline/promises");
 const { spawnSync } = require("node:child_process");
 const {
   CHROME_EXE,
+  DATA_ROOT,
   DEFAULT_CDP_PORT,
   DEFAULT_PWCLI_SESSION,
   USER_DATA_DIR,
+  USER_DATA_DIR_IS_DEFAULT,
   BACKUP_ROOT,
 } = require("./config");
 const {
@@ -49,7 +52,7 @@ function usage(exitCode = 0) {
 persistent-browser-cli
 
 Usage:
-  pbc open [url] [--port 9222] [--reuse] [--match "<text>"] [--tab <id>]
+  pbc open [url] [--port 9222] [--reuse] [--match "<text>"] [--tab <id>] [--profile-source stable|beta|dev|canary|empty|<path>] [--no-profile-clone]
   pbc cdp [--port 9222]
   pbc doctor [--port 9222]
   pbc saveandclose [--port 9222]
@@ -60,22 +63,26 @@ Usage:
 
   pbc tab list [--all] [--port 9222]
   pbc tab activate <id|match> [--port 9222]
-  pbc tab goto <id|match|active> <url> [--port 9222]
+  pbc tab goto <id|match|active> <url> [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab close <id|match> [--port 9222]
   pbc tab frames <id|match|active> [--port 9222]
   pbc tab inspect <id|match|active> [--frame <name-or-url>] [--port 9222]
-  pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]
-  pbc tab text <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]
-  pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--port 9222]
-  pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--port 9222]
-  pbc tab screenshot <id|match|active> [path] [--full-page] [--port 9222]
-  pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--port 9222]
+  pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab text <id|match|active> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab screenshot <id|match|active> [path] [--full-page] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab prune [--port 9222] [--keep <id|match>]
+
+  pbc trace list
+  pbc trace latest
 
   pbc pw <playwright-cli args...>
 
 Environment overrides:
   PBC_CHROME_EXE
+  PBC_DATA_ROOT
   PBC_USER_DATA_DIR
   PBC_BACKUP_ROOT
   PBC_CDP_PORT
@@ -86,6 +93,7 @@ Environment overrides:
 
 Defaults:
   chromeExe:   ${CHROME_EXE}
+  dataRoot:    ${DATA_ROOT}
   userDataDir: ${USER_DATA_DIR}
   backupRoot:  ${BACKUP_ROOT}
 `.trim();
@@ -109,11 +117,11 @@ function positionalArgs(argv) {
   const result = [];
   for (let i = 0; i < argv.length; i += 1) {
     const value = argv[i];
-    if (value === "--port" || value === "--frame" || value === "--keep" || value === "--match" || value === "--tab") {
+    if (value === "--port" || value === "--frame" || value === "--keep" || value === "--match" || value === "--tab" || value === "--trace-dir") {
       i += 1;
       continue;
     }
-    if (value === "--json" || value === "--full-page" || value === "--all" || value === "--reuse") {
+    if (value === "--json" || value === "--full-page" || value === "--all" || value === "--reuse" || value === "--trace") {
       continue;
     }
     if (String(value || "").startsWith("--")) {
@@ -152,6 +160,164 @@ function findCommand(command) {
 function getProfileLockFiles(userDataDir) {
   const names = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
   return names.filter((name) => fs.existsSync(path.join(userDataDir, name)));
+}
+
+function chromeChannels() {
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  const programFiles = process.env.PROGRAMFILES || "C:\\Program Files";
+  const programFilesX86 = process.env["PROGRAMFILES(X86)"] || "C:\\Program Files (x86)";
+  return [
+    {
+      id: "stable",
+      label: "Google Chrome Stable",
+      exeCandidates: [
+        path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+        path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+        path.join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+      ],
+      userDataDir: path.join(localAppData, "Google", "Chrome", "User Data"),
+    },
+    {
+      id: "beta",
+      label: "Google Chrome Beta",
+      exeCandidates: [
+        path.join(programFiles, "Google", "Chrome Beta", "Application", "chrome.exe"),
+        path.join(programFilesX86, "Google", "Chrome Beta", "Application", "chrome.exe"),
+        path.join(localAppData, "Google", "Chrome Beta", "Application", "chrome.exe"),
+      ],
+      userDataDir: path.join(localAppData, "Google", "Chrome Beta", "User Data"),
+    },
+    {
+      id: "dev",
+      label: "Google Chrome Dev",
+      exeCandidates: [
+        path.join(programFiles, "Google", "Chrome Dev", "Application", "chrome.exe"),
+        path.join(programFilesX86, "Google", "Chrome Dev", "Application", "chrome.exe"),
+        path.join(localAppData, "Google", "Chrome Dev", "Application", "chrome.exe"),
+      ],
+      userDataDir: path.join(localAppData, "Google", "Chrome Dev", "User Data"),
+    },
+    {
+      id: "canary",
+      label: "Google Chrome Canary",
+      exeCandidates: [
+        path.join(localAppData, "Google", "Chrome SxS", "Application", "chrome.exe"),
+        path.join(programFiles, "Google", "Chrome SxS", "Application", "chrome.exe"),
+      ],
+      userDataDir: path.join(localAppData, "Google", "Chrome SxS", "User Data"),
+    },
+  ].map((channel) => ({
+    ...channel,
+    exe: channel.exeCandidates.find((candidate) => fs.existsSync(candidate)) || channel.exeCandidates[0],
+    installed: channel.exeCandidates.some((candidate) => fs.existsSync(candidate)) || fs.existsSync(channel.userDataDir),
+    hasProfile: fs.existsSync(channel.userDataDir),
+  }));
+}
+
+function resolveProfileSource(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  if (/^empty$/i.test(raw)) return { mode: "empty" };
+  const channel = chromeChannels().find((candidate) => candidate.id === raw.toLowerCase());
+  if (channel) return { mode: "clone", ...channel };
+  return { mode: "clone", id: "custom", label: "Custom Chrome profile", userDataDir: path.resolve(raw), hasProfile: fs.existsSync(path.resolve(raw)) };
+}
+
+async function promptProfileSource(candidates) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
+  const choices = candidates.filter((candidate) => candidate.hasProfile);
+  const lines = [
+    "[pbc] No persistent profile exists at the default Codex profile path:",
+    `      ${USER_DATA_DIR}`,
+    "[pbc] Choose a Chrome profile to clone, or create an empty profile:",
+    ...choices.map((candidate, index) => `  ${index + 1}. ${candidate.label} (${candidate.userDataDir})`),
+    `  ${choices.length + 1}. Empty new profile`,
+    "",
+  ];
+  console.log(lines.join("\n"));
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(`Select 1-${choices.length + 1}: `);
+    const index = Number(answer);
+    if (!Number.isInteger(index) || index < 1 || index > choices.length + 1) {
+      throw new Error("Invalid profile selection.");
+    }
+    if (index === choices.length + 1) return { mode: "empty" };
+    return { mode: "clone", ...choices[index - 1] };
+  } finally {
+    rl.close();
+  }
+}
+
+function chromeProcessRunning() {
+  const result = spawnSync("tasklist.exe", ["/FI", "IMAGENAME eq chrome.exe"], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if ((result.status ?? 1) !== 0) return false;
+  return /chrome\.exe/i.test(String(result.stdout || ""));
+}
+
+function shouldCopyProfileEntry(source) {
+  const name = path.basename(source).toLowerCase();
+  if (name.startsWith("singleton")) return false;
+  if (["crashpad", "shadercache", "grshadercache", "pnacltranslationcache", "swreporter"].includes(name)) return false;
+  return true;
+}
+
+async function ensureDefaultProfile(argv) {
+  if (fs.existsSync(USER_DATA_DIR)) return;
+
+  if (!USER_DATA_DIR_IS_DEFAULT) {
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    return;
+  }
+
+  if (hasFlag("--no-profile-clone", argv)) {
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    console.log(`[pbc] Created empty persistent profile: ${USER_DATA_DIR}`);
+    return;
+  }
+
+  const explicitSource = readArg("--profile-source", argv);
+  let source = explicitSource ? resolveProfileSource(explicitSource) : null;
+  if (!source) source = await promptProfileSource(chromeChannels());
+
+  if (!source) {
+    const available = chromeChannels()
+      .filter((channel) => channel.hasProfile)
+      .map((channel) => `${channel.id}=${channel.userDataDir}`)
+      .join("; ");
+    throw new Error(
+      [
+        `Persistent profile is missing: ${USER_DATA_DIR}`,
+        "Run again with --profile-source stable|beta|dev|canary|empty|<path>, or run from an interactive terminal to choose.",
+        available ? `Detected profiles: ${available}` : "No existing Chrome user-data directories were detected.",
+      ].join("\n")
+    );
+  }
+
+  if (source.mode === "empty") {
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    console.log(`[pbc] Created empty persistent profile: ${USER_DATA_DIR}`);
+    return;
+  }
+
+  if (!source.hasProfile || !fs.existsSync(source.userDataDir)) {
+    throw new Error(`Chrome profile source not found: ${source.userDataDir}`);
+  }
+
+  if (chromeProcessRunning()) {
+    throw new Error(`Close Chrome before cloning a profile from ${source.userDataDir}`);
+  }
+
+  fs.mkdirSync(path.dirname(USER_DATA_DIR), { recursive: true });
+  console.log(`[pbc] Cloning ${source.label} profile into ${USER_DATA_DIR}`);
+  fs.cpSync(source.userDataDir, USER_DATA_DIR, {
+    recursive: true,
+    filter: shouldCopyProfileEntry,
+  });
 }
 
 async function isCdpUp(port) {
@@ -400,6 +566,130 @@ function defaultScreenshotPath() {
   return path.join(outDir, `pbc-screenshot-${stamp}.png`);
 }
 
+function traceRoot() {
+  return path.join(ROOT, "output", "pbc-traces");
+}
+
+function safeName(value) {
+  return String(value || "trace")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "trace";
+}
+
+function makeTraceDir(commandName, argv) {
+  const explicit = readArg("--trace-dir", argv);
+  if (explicit) {
+    const dir = path.resolve(explicit);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  fs.mkdirSync(traceRoot(), { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const base = path.join(traceRoot(), `${stamp}-${safeName(commandName)}`);
+  let dir = base;
+  let suffix = 1;
+  while (fs.existsSync(dir)) {
+    dir = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function errorInfo(error) {
+  if (!error) return null;
+  return {
+    name: error.name || "Error",
+    message: error.message || String(error),
+    stack: error.stack || "",
+  };
+}
+
+async function captureTraceState(port, token, frame, dir, phase, options = {}) {
+  const state = { phase, capturedAt: new Date().toISOString(), errors: [] };
+  const screenshotPath = path.join(dir, `${phase}.png`);
+  const includeSnapshot = options.includeSnapshot !== false;
+
+  try {
+    const screenshot = await screenshotTab(port, token, screenshotPath, { fullPage: true });
+    state.screenshot = screenshot.path;
+    state.url = screenshot.url;
+  } catch (error) {
+    state.errors.push({ step: "screenshot", ...errorInfo(error) });
+  }
+
+  if (includeSnapshot) {
+    try {
+      const snapshot = await snapshotTab(port, token, { frame });
+      state.snapshot = snapshot;
+      fs.writeFileSync(path.join(dir, `${phase}-snapshot.json`), JSON.stringify(snapshot, null, 2));
+    } catch (error) {
+      state.errors.push({ step: "snapshot", ...errorInfo(error) });
+    }
+  }
+
+  try {
+    const text = await textTab(port, token, { frame });
+    state.text = { tab: text.tab, frame: text.frame, length: text.text.length };
+    fs.writeFileSync(path.join(dir, `${phase}-text.txt`), text.text);
+  } catch (error) {
+    state.errors.push({ step: "text", ...errorInfo(error) });
+  }
+
+  return state;
+}
+
+async function runWithTrace(options, action) {
+  const { enabled, port, token, frame, commandName, argv } = options;
+  if (!enabled) return await action();
+
+  const dir = makeTraceDir(commandName, argv);
+  const trace = {
+    command: commandName,
+    argv,
+    port,
+    token,
+    frame: frame || null,
+    startedAt: new Date().toISOString(),
+    traceDir: dir,
+    before: null,
+    after: null,
+    result: null,
+    error: null,
+  };
+
+  try {
+    trace.before = await captureTraceState(port, token, frame, dir, "before", { includeSnapshot: false });
+    const result = await action();
+    trace.result = result;
+    trace.after = await captureTraceState(port, token, frame, dir, "after");
+    return result;
+  } catch (error) {
+    trace.error = errorInfo(error);
+    trace.after = await captureTraceState(port, token, frame, dir, "after-error");
+    throw error;
+  } finally {
+    trace.finishedAt = new Date().toISOString();
+    fs.writeFileSync(path.join(dir, "trace.json"), JSON.stringify(trace, null, 2));
+    console.log(`[pbc] Trace saved: ${dir}`);
+  }
+}
+
+function listTraceDirs() {
+  if (!fs.existsSync(traceRoot())) return [];
+  return fs.readdirSync(traceRoot(), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const fullPath = path.join(traceRoot(), entry.name);
+      const stat = fs.statSync(fullPath);
+      return { name: entry.name, path: fullPath, mtimeMs: stat.mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   if (argv.length === 0) usage(0);
@@ -415,6 +705,7 @@ async function main() {
     const reuse = hasFlag("--reuse", argv);
     const match = readArg("--match", argv);
     const tab = readArg("--tab", argv);
+    await ensureDefaultProfile(argv);
     const up = await isCdpUp(port);
     if (up) {
       const reused = await reuseOrOpenTab(port, url, {
@@ -589,6 +880,35 @@ async function main() {
     process.exit(status);
   }
 
+  if (cmd === "trace") {
+    const sub = argv[1] || "list";
+    const traces = listTraceDirs();
+
+    if (sub === "list") {
+      if (!traces.length) {
+        console.log("[pbc] No traces found.");
+        process.exit(0);
+      }
+      for (const trace of traces.slice(0, 20)) {
+        console.log(`${trace.name} | ${trace.path}`);
+      }
+      process.exit(0);
+    }
+
+    if (sub === "latest") {
+      const latest = traces[0];
+      if (!latest) {
+        console.log("[pbc] No traces found.");
+        process.exit(1);
+      }
+      console.log(latest.path);
+      process.exit(0);
+    }
+
+    console.log("Usage: pbc trace list | latest");
+    process.exit(1);
+  }
+
   if (cmd === "tab") {
     const sub = argv[1];
     const port = Number(readArg("--port", argv) || DEFAULT_CDP_PORT);
@@ -622,10 +942,17 @@ async function main() {
       const token = argv[2];
       const url = argv[3];
       if (!token || token.startsWith("-") || !url || url.startsWith("-")) {
-        console.log("Usage: pbc tab goto <id|match|active> <url> [--port 9222]");
+        console.log("Usage: pbc tab goto <id|match|active> <url> [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const result = await gotoTab(port, token, url);
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame: null,
+        commandName: "tab-goto",
+        argv,
+      }, () => gotoTab(port, token, url));
       console.log(`[pbc] Reused tab [${result.id}] ${result.url}`);
       process.exit(0);
     }
@@ -693,10 +1020,17 @@ async function main() {
       const token = args[0];
       const frame = readArg("--frame", argv);
       if (!token || token.startsWith("-")) {
-        console.log("Usage: pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]");
+        console.log("Usage: pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const info = await snapshotTab(port, token, { frame });
+      const info = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-snapshot",
+        argv,
+      }, () => snapshotTab(port, token, { frame }));
       if (hasFlag("--json", argv)) printJson(info);
       else renderSnapshot(info);
       process.exit(0);
@@ -707,10 +1041,17 @@ async function main() {
       const token = args[0];
       const frame = readArg("--frame", argv);
       if (!token || token.startsWith("-")) {
-        console.log("Usage: pbc tab text <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]");
+        console.log("Usage: pbc tab text <id|match|active> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const info = await textTab(port, token, { frame });
+      const info = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-text",
+        argv,
+      }, () => textTab(port, token, { frame }));
       if (hasFlag("--json", argv)) printJson(info);
       else {
         console.log(`[pbc] Frame: ${info.frame.name || "(no name)"} | ${info.frame.url}`);
@@ -725,10 +1066,17 @@ async function main() {
       const target = args.slice(1).join(" ");
       const frame = readArg("--frame", argv);
       if (!token || !target) {
-        console.log("Usage: pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--port 9222]");
+        console.log("Usage: pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const result = await clickTab(port, token, target, { frame });
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-click",
+        argv,
+      }, () => clickTab(port, token, target, { frame }));
       console.log(`[pbc] Clicked ${result.mode} ${JSON.stringify(result.clicked)}.`);
       process.exit(0);
     }
@@ -740,10 +1088,17 @@ async function main() {
       const value = args.slice(2).join(" ");
       const frame = readArg("--frame", argv);
       if (!token || !target || value.length === 0) {
-        console.log("Usage: pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--port 9222]");
+        console.log("Usage: pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const result = await fillTab(port, token, target, value, { frame });
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-fill",
+        argv,
+      }, () => fillTab(port, token, target, value, { frame }));
       console.log(`[pbc] Filled ${result.mode} ${JSON.stringify(result.filled)} using ${result.method}.`);
       process.exit(0);
     }
@@ -753,11 +1108,18 @@ async function main() {
       const token = args[0];
       const outputPath = path.resolve(args[1] || defaultScreenshotPath());
       if (!token || token.startsWith("-")) {
-        console.log("Usage: pbc tab screenshot <id|match|active> [path] [--full-page] [--port 9222]");
+        console.log("Usage: pbc tab screenshot <id|match|active> [path] [--full-page] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
       fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-      const result = await screenshotTab(port, token, outputPath, { fullPage: hasFlag("--full-page", argv) });
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame: null,
+        commandName: "tab-screenshot",
+        argv,
+      }, () => screenshotTab(port, token, outputPath, { fullPage: hasFlag("--full-page", argv) }));
       console.log(`[pbc] Screenshot saved: ${result.path}`);
       process.exit(0);
     }
@@ -768,10 +1130,17 @@ async function main() {
       const source = args.slice(1).join(" ");
       const frame = readArg("--frame", argv);
       if (!token || !source) {
-        console.log("Usage: pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--port 9222]");
+        console.log("Usage: pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const result = await evalTab(port, token, source, { frame });
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-eval",
+        argv,
+      }, () => evalTab(port, token, source, { frame }));
       if (hasFlag("--json", argv)) printJson(result);
       else if (typeof result.value === "string") console.log(result.value);
       else printJson(result.value);

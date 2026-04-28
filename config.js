@@ -23,7 +23,7 @@ function resolveChromeExe() {
 
 const DATA_ROOT =
   process.env.PBC_DATA_ROOT ||
-  path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "persistent-browser-cli");
+  path.join(os.homedir(), ".codex", "pbcDataDir");
 
 function loadLocalOverrides() {
   const localPath = path.join(__dirname, "config.local.json");
@@ -41,6 +41,8 @@ const local = loadLocalOverrides();
 module.exports = {
   CHROME_EXE: process.env.PBC_CHROME_EXE || local.CHROME_EXE || resolveChromeExe(),
   USER_DATA_DIR: process.env.PBC_USER_DATA_DIR || local.USER_DATA_DIR || path.join(DATA_ROOT, "profiles", "default"),
+  USER_DATA_DIR_IS_DEFAULT: !process.env.PBC_USER_DATA_DIR && !local.USER_DATA_DIR,
+  DATA_ROOT,
   BACKUP_ROOT: process.env.PBC_BACKUP_ROOT || local.BACKUP_ROOT || path.join(DATA_ROOT, "backups"),
   DEFAULT_CDP_PORT: envInt("PBC_CDP_PORT", local.DEFAULT_CDP_PORT || 9222),
   DEFAULT_PWCLI_SESSION: process.env.PBC_PWCLI_SESSION || local.DEFAULT_PWCLI_SESSION || "persistent-browser-cli",
