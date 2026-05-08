@@ -2,6 +2,11 @@
 
 A Windows-focused CLI for driving a persistent Chrome profile over CDP and Playwright.
 
+## License And Branding
+
+Code is licensed under the MIT license. The Persistent Browser CLI and PBC names
+are reserved trademarks; see `LICENSE` and `TRADEMARKS.md`.
+
 This repo is the reusable subset of the custom browser tooling:
 - launch Chrome with a persistent profile
 - reuse or navigate existing tabs
