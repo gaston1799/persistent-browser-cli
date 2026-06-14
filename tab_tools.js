@@ -618,6 +618,65 @@ async function fillTab(port, token, target, value, options = {}) {
   });
 }
 
+function resolveTargetLocator(frame, raw) {
+  if (/^e\d+$/i.test(raw)) {
+    const ref = raw.toLowerCase();
+    return { locator: frame.locator(`[data-pbc-ref="${ref}"]`).first(), mode: "ref", resolved: ref };
+  }
+  if (looksLikeSelector(raw)) {
+    return { locator: frame.locator(raw).first(), mode: "selector", resolved: raw };
+  }
+  return { locator: frame.getByText(raw, { exact: false }).first(), mode: "text", resolved: raw };
+}
+
+async function uploadTab(port, token, target, filePaths, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+
+    const frame = await resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const raw = String(target || "").trim();
+    if (!raw) throw new Error("Upload target is required.");
+    if (!Array.isArray(filePaths) || filePaths.length === 0) throw new Error("At least one file path is required.");
+
+    const files = filePaths.map((filePath) => path.resolve(String(filePath || "")));
+    for (const filePath of files) {
+      if (!fs.existsSync(filePath)) throw new Error(`Upload file does not exist: ${filePath}`);
+      if (!fs.statSync(filePath).isFile()) throw new Error(`Upload path is not a file: ${filePath}`);
+    }
+
+    const { locator, mode, resolved } = resolveTargetLocator(frame, raw);
+    const directInput = await locator.evaluateHandle((node) => {
+      if (node instanceof HTMLInputElement && node.type === "file") return node;
+      const nested = node.querySelector?.("input[type='file']");
+      if (nested) return nested;
+      if (node instanceof HTMLLabelElement && node.htmlFor) return document.getElementById(node.htmlFor);
+      return null;
+    }).catch(() => null);
+
+    const directElement = directInput ? directInput.asElement() : null;
+    if (directElement) {
+      const acceptsMultiple = await directElement.evaluate((node) => Boolean(node.multiple));
+      if (files.length > 1 && !acceptsMultiple) {
+        await directElement.dispose().catch(() => {});
+        throw new Error("Upload target does not accept multiple files.");
+      }
+      await directElement.setInputFiles(files);
+      await directElement.dispose().catch(() => {});
+      return { uploaded: files, mode, target: resolved, method: "setInputFiles", multiple: acceptsMultiple, url: tab.page.url() };
+    }
+    await directInput?.dispose?.().catch(() => {});
+
+    const chooserPromise = tab.page.waitForEvent("filechooser", { timeout: DEFAULT_TAB_ACTION_TIMEOUT_MS });
+    await locator.click();
+    const chooser = await chooserPromise;
+    if (files.length > 1 && !chooser.isMultiple()) throw new Error("Upload target does not accept multiple files.");
+    await chooser.setFiles(files);
+    return { uploaded: files, mode, target: resolved, method: "filechooser", multiple: chooser.isMultiple(), url: tab.page.url() };
+  });
+}
+
 async function screenshotTab(port, token, outputPath, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
     await ensureUsableViewport(tab.page);
@@ -796,5 +855,6 @@ module.exports = {
   screenshotTab,
   snapshotTab,
   textTab,
+  uploadTab,
   reuseOrOpenTab,
 };

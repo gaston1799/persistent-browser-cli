@@ -32,6 +32,7 @@ const {
   screenshotTab,
   snapshotTab,
   textTab,
+  uploadTab,
   reuseOrOpenTab,
 } = require("./tab_tools");
 
@@ -57,6 +58,7 @@ Usage:
   pbc backup [--kill]
   pbc update [--check-only] [--port 9222]
   pbc install [--repo-url <url>] [--install-root <path>] [--link-global] [--clone-stable-chrome-profile]
+  pbc upload <ref|selector|text> <file> [more-files...] [--frame <name-or-url>] [--port 9222]
 
   pbc tab list [--all] [--port 9222]
   pbc tab activate <id|match> [--port 9222]
@@ -68,6 +70,7 @@ Usage:
   pbc tab text <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]
   pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--port 9222]
   pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--port 9222]
+  pbc tab upload <id|match|active> <ref|selector|text> <file> [more-files...] [--frame <name-or-url>] [--port 9222]
   pbc tab screenshot <id|match|active> [path] [--full-page] [--port 9222]
   pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--port 9222]
   pbc tab prune [--port 9222] [--keep <id|match>]
@@ -748,6 +751,21 @@ async function main() {
       process.exit(0);
     }
 
+    if (sub === "upload") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args[1];
+      const files = args.slice(2);
+      const frame = readArg("--frame", argv);
+      if (!token || !target || files.length === 0) {
+        console.log("Usage: pbc tab upload <id|match|active> <ref|selector|text> <file> [more-files...] [--frame <name-or-url>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await uploadTab(port, token, target, files, { frame });
+      console.log(`[pbc] Uploaded ${result.uploaded.length} file${result.uploaded.length === 1 ? "" : "s"} to ${result.mode} ${JSON.stringify(result.target)} using ${result.method}.`);
+      process.exit(0);
+    }
+
     if (sub === "screenshot") {
       const args = positionalArgs(argv.slice(2));
       const token = args[0];
@@ -807,6 +825,21 @@ async function main() {
       runPlaywrightCli(["snapshot"]);
     }
     process.exit(status);
+  }
+
+  if (cmd === "upload") {
+    const args = positionalArgs(argv.slice(1));
+    const port = Number(readArg("--port", argv) || DEFAULT_CDP_PORT);
+    const target = args[0];
+    const files = args.slice(1);
+    const frame = readArg("--frame", argv);
+    if (!target || files.length === 0) {
+      console.log("Usage: pbc upload <ref|selector|text> <file> [more-files...] [--frame <name-or-url>] [--port 9222]");
+      process.exit(1);
+    }
+    const result = await uploadTab(port, "active", target, files, { frame });
+    console.log(`[pbc] Uploaded ${result.uploaded.length} file${result.uploaded.length === 1 ? "" : "s"} to ${result.mode} ${JSON.stringify(result.target)} using ${result.method}.`);
+    process.exit(0);
   }
 
   usage(1);
