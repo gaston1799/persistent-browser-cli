@@ -1,11 +1,13 @@
-const fs = require("node:fs");
+﻿const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { chromium } = require("playwright-core");
 
 function formatTabLabel(tab) {
   const marker = tab.active ? "*" : " ";
   const title = tab.title ? ` | ${tab.title}` : "";
-  return `${marker} [${tab.id}] ${tab.url}${title}`;
+  const stalled = tab.stalled ? " [STALLED]" : "";
+  return `${marker} [${tab.id}] ${tab.url}${title}${stalled}`;
 }
 
 function isInternalTab(tab) {
@@ -42,16 +44,38 @@ function normalizeUrl(value) {
   }
 }
 
-async function connectPages(port) {
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+function cdpTimeoutMs() {
+  return Math.min(Math.max(Number(process.env.PBC_CDP_TIMEOUT_MS) || 10000, 1000), 120000);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, ms, label) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function enumeratePages(browser) {
   const tabs = [];
   let nextId = 0;
 
   for (const context of browser.contexts()) {
     for (const page of context.pages()) {
       const url = page.url();
-      const title = await page.title().catch(() => "");
-      const active = await page.evaluate(() => document.hasFocus()).catch(() => false);
+      let stalled = false;
+      const title = await withTimeout(page.title(), 1200, "tab title").catch(() => {
+        stalled = true;
+        return "";
+      });
+      let active = false;
+      await withTimeout(page.evaluate(() => document.hasFocus()), 1200, "tab focus").catch(() => {
+        stalled = true;
+      });
       tabs.push({
         id: String(nextId),
         index: nextId,
@@ -59,12 +83,34 @@ async function connectPages(port) {
         url,
         title,
         active,
+        stalled,
       });
       nextId += 1;
     }
   }
 
-  return { browser, tabs };
+  return tabs;
+}
+
+async function connectPages(port, options = {}) {
+  const timeout = cdpTimeoutMs();
+  const maxAttempts = Math.min(Math.max(Number(options.retries) || 2, 0), 5) + 1;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let browser = null;
+    try {
+      browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout });
+      const tabs = await withTimeout(enumeratePages(browser), timeout + 5000, "CDP page enumeration");
+      return { browser, tabs };
+    } catch (error) {
+      lastError = error;
+      if (browser) await browser.close().catch(() => {});
+      if (attempt < maxAttempts) await sleep(250 * attempt);
+    }
+  }
+
+  throw lastError;
 }
 
 async function withResolvedTab(port, token, fn) {
@@ -164,11 +210,18 @@ async function gotoTab(port, token, url) {
 }
 
 async function closeTab(port, token) {
-  return withResolvedTab(port, token, async (tab) => {
+  const { browser, tabs } = await connectPages(port);
+  try {
+    const tab = resolveTab(tabs, token);
     const result = { id: tab.id, url: tab.url, title: tab.title };
+    const shifted = tabs
+      .filter((other) => other.index > tab.index && !isInternalTab(other))
+      .map((other) => ({ id: other.id, url: other.url, title: other.title }));
     await tab.page.close({ runBeforeUnload: false });
-    return result;
-  });
+    return { ...result, shifted };
+  } finally {
+    await browser.close().catch(() => {});
+  }
 }
 
 async function pruneDuplicateTabs(port, keepToken = null) {
@@ -436,12 +489,196 @@ async function ensureUsableViewport(page) {
   }
 }
 
+function refsStorePath() {
+  return path.join(os.tmpdir(), "pbc", "refs-store.json");
+}
+
+function loadRefsStore() {
+  try {
+    return JSON.parse(fs.readFileSync(refsStorePath(), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveRefsStore(store) {
+  fs.mkdirSync(path.dirname(refsStorePath()), { recursive: true });
+  fs.writeFileSync(refsStorePath(), JSON.stringify(store), "utf8");
+}
+
+function persistTabRefs(tabId, frameUrl, items) {
+  try {
+    const store = loadRefsStore();
+    const key = String(tabId);
+    const entries = (store[key] || []).filter((entry) => entry.frameUrl !== frameUrl);
+    entries.push({ frameUrl, items, capturedAt: new Date().toISOString() });
+    store[key] = entries.slice(-10);
+    saveRefsStore(store);
+  } catch {
+    // Best-effort optimization; never break snapshot over it.
+  }
+}
+
+function lookupRefSignature(tabId, frameUrl, ref) {
+  try {
+    const store = loadRefsStore();
+    const entries = store[String(tabId)] || [];
+    const ordered = [...entries].reverse();
+    const entry = ordered.find((candidate) => candidate.frameUrl === frameUrl) || ordered[0];
+    if (!entry) return null;
+    return entry.items.find((item) => item.ref === ref) || null;
+  } catch {
+    return null;
+  }
+}
+
+async function elementState(locator) {
+  try {
+    return await locator.evaluate((node) => {
+      const style = window.getComputedStyle(node);
+      const rect = node.getBoundingClientRect();
+      return {
+        tag: node.tagName.toLowerCase(),
+        id: node.id || "",
+        name: node.getAttribute("name") || "",
+        type: node.getAttribute("type") || "",
+        role: node.getAttribute("role") || "",
+        ref: node.getAttribute("data-pbc-ref") || "",
+        text: (node.innerText || node.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120),
+        ariaLabel: node.getAttribute("aria-label") || "",
+        display: style.display,
+        visibility: style.visibility,
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        visible: style.display !== "none" && style.visibility !== "hidden" && style.visibility !== "collapse" && rect.width > 0 && rect.height > 0,
+        disabled: Boolean(node.disabled || node.getAttribute("aria-disabled") === "true"),
+      };
+    });
+  } catch {
+    return null;
+  }
+}
+
+function signatureFromState(state) {
+  return { tag: state.tag, id: state.id, name: state.name, type: state.type };
+}
+
+function signatureMatches(current, expected) {
+  if (current.tag !== expected.tag) return false;
+  if (expected.id && expected.id !== current.id) return false;
+  if (expected.name && expected.name !== current.name) return false;
+  if (expected.type && expected.type !== current.type) return false;
+  return true;
+}
+
+function describeState(state) {
+  const parts = [`<${state.tag}>`];
+  if (state.id) parts.push(`#${state.id}`);
+  if (state.name) parts.push(`name=${state.name}`);
+  if (state.type) parts.push(`type=${state.type}`);
+  if (state.ref) parts.push(`ref=${state.ref}`);
+  if (state.text) parts.push(JSON.stringify(state.text.slice(0, 40)));
+  if (state.disabled) parts.push("disabled");
+  if (!state.visible) parts.push(`not visible (display=${state.display}, visibility=${state.visibility}, ${state.width}x${state.height})`);
+  return parts.join(" ");
+}
+
+function describeSignature(expected) {
+  const parts = [`<${expected.tag}>`];
+  if (expected.id) parts.push(`#${expected.id}`);
+  if (expected.name) parts.push(`name=${expected.name}`);
+  if (expected.type) parts.push(`type=${expected.type}`);
+  if (expected.label) parts.push(JSON.stringify(String(expected.label).slice(0, 40)));
+  return parts.join(" ");
+}
+
+async function locatorExists(locator) {
+  const count = await locator.count().catch(() => 0);
+  return count > 0;
+}
+
+async function resolveTargetLocator(frame, raw, options = {}) {
+  const { tabId, frameUrl, kind = "input" } = options;
+  const trimmed = String(raw || "").trim();
+  if (!trimmed) throw new Error("Target is required.");
+
+  if (/^e\d+$/i.test(trimmed)) {
+    const ref = trimmed.toLowerCase();
+    const locator = frame.locator(`[data-pbc-ref="${ref}"]`).first();
+    const expected = lookupRefSignature(tabId, frameUrl, ref);
+    if (expected) {
+      const state = await elementState(locator);
+      if (!state) {
+        throw new Error(
+          `Ref ${ref} is no longer in the DOM (snapshot had ${describeSignature(expected)}). Run 'pbc tab snapshot' again and use a fresh ref.`
+        );
+      }
+      const current = signatureFromState(state);
+      if (!signatureMatches(current, expected)) {
+        throw new Error(
+          `Ref ${ref} went stale: it now points to ${describeState(state)} but the snapshot recorded ${describeSignature(expected)}. Run 'pbc tab snapshot' again and use a fresh ref.`
+        );
+      }
+    }
+    return { locator, mode: "ref" };
+  }
+
+  if (looksLikeSelector(trimmed)) {
+    return { locator: frame.locator(trimmed).first(), mode: "selector" };
+  }
+
+  if (kind === "click") {
+    return { locator: frame.getByText(trimmed, { exact: false }).first(), mode: "text" };
+  }
+
+  const labelLocator = frame.getByLabel(trimmed, { exact: false }).first();
+  if (await locatorExists(labelLocator)) return { locator: labelLocator, mode: "label" };
+
+  const placeholderLocator = frame.getByPlaceholder(trimmed, { exact: false }).first();
+  if (await locatorExists(placeholderLocator)) return { locator: placeholderLocator, mode: "placeholder" };
+
+  return { locator: labelLocator, mode: "label" };
+}
+
+async function clickLocatorFastFail(locator, options = {}) {
+  const timeout = actionTimeoutMs(options);
+  const state = await elementState(locator);
+  if (state) {
+    if (state.disabled) {
+      throw new Error(`Cannot click target: ${describeState(state)} is disabled.`);
+    }
+    if (!state.visible) {
+      throw new Error(`Cannot click target: ${describeState(state)} is not visible.`);
+    }
+  }
+  try {
+    await locator.click({ timeout });
+  } catch (error) {
+    const after = await elementState(locator);
+    const detail = after ? describeState(after) : "the target element is not in the DOM";
+    throw new Error(`Cannot click target: ${detail}. ${error.message}`);
+  }
+}
+
+function actionTimeoutMs(options = {}) {
+  const value = Number(options.timeoutMs);
+  if (!Number.isFinite(value) || value <= 0) return 5000;
+  return Math.min(Math.max(value, 100), 120000);
+}
+
+function clampDelay(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return 40;
+  return Math.min(Math.max(ms, 0), 5000);
+}
+
 async function snapshotTab(port, token, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
     const items = await frame.evaluate(() => {
+      document.querySelectorAll("[data-pbc-ref]").forEach((node) => node.removeAttribute("data-pbc-ref"));
       const selector = [
         "a",
         "button",
@@ -517,6 +754,8 @@ async function snapshotTab(port, token, options = {}) {
         });
     });
 
+    persistTabRefs(tab.id, frame.url(), items);
+
     return {
       tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) },
       frame: { name: frame.name() || "", url: frame.url() },
@@ -530,10 +769,36 @@ async function textTab(port, token, options = {}) {
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
-    const text = await frame.evaluate(() => {
+    const includeValues = Boolean(options.includeValues);
+
+    const text = await frame.evaluate((opts) => {
       const source = document.body?.innerText || document.documentElement?.textContent || "";
-      return source.trim().replace(/\n{3,}/g, "\n\n");
-    });
+      let output = source.trim().replace(/\n{3,}/g, "\n\n");
+
+      if (opts.includeValues) {
+        const valueLines = [];
+        const seen = new Set();
+        document.querySelectorAll("input, textarea, select").forEach((node) => {
+          const type = String(node.getAttribute("type") || "").toLowerCase();
+          if (type === "password") return;
+          const value = node.value != null ? String(node.value) : "";
+          if (!value) return;
+          const id = node.id ? `#${node.id}` : "";
+          const name = node.getAttribute("name") ? ` name=${JSON.stringify(node.getAttribute("name"))}` : "";
+          const placeholder = node.getAttribute("placeholder") ? ` placeholder=${JSON.stringify(node.getAttribute("placeholder"))}` : "";
+          const line = `[${node.tagName.toLowerCase()}${id}${name}${placeholder}] = ${JSON.stringify(value)}`;
+          if (!seen.has(line)) {
+            seen.add(line);
+            valueLines.push(line);
+          }
+        });
+        if (valueLines.length) {
+          output = `${output}\n\n-- input values --\n${valueLines.join("\n")}`;
+        }
+      }
+
+      return output;
+    }, { includeValues });
 
     return {
       tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) },
@@ -553,37 +818,267 @@ async function clickTab(port, token, target, options = {}) {
     const raw = String(target || "").trim();
     if (!raw) throw new Error("Click target is required.");
 
-    if (/^e\d+$/i.test(raw)) {
-      const ref = raw.toLowerCase();
-      await frame.locator(`[data-pbc-ref="${ref}"]`).first().click();
-      return { clicked: ref, mode: "ref", url: tab.page.url() };
-    }
+    const { locator, mode } = await resolveTargetLocator(frame, raw, {
+      tabId: tab.id,
+      frameUrl: frame.url(),
+      kind: "click",
+    });
+    await clickLocatorFastFail(locator, { timeoutMs: options.timeoutMs });
 
-    if (looksLikeSelector(raw)) {
-      await frame.locator(raw).first().click();
-      return { clicked: raw, mode: "selector", url: tab.page.url() };
-    }
-
-    await frame.getByText(raw, { exact: false }).first().click();
-    return { clicked: raw, mode: "text", url: tab.page.url() };
+    return { clicked: raw, mode, url: tab.page.url() };
   });
 }
 
-async function fillLocator(locator, value) {
+async function holdTab(port, token, target, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+
+    const frame = await resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const raw = String(target || "").trim();
+    if (!raw) throw new Error("Hold target is required.");
+
+    const { locator, mode } = await resolveTargetLocator(frame, raw, {
+      tabId: tab.id,
+      frameUrl: frame.url(),
+      kind: "click",
+    });
+
+    const state = await elementState(locator);
+    if (state) {
+      if (state.disabled) throw new Error(`Cannot hold target: ${describeState(state)} is disabled.`);
+      if (!state.visible) throw new Error(`Cannot hold target: ${describeState(state)} is not visible.`);
+    }
+
+    const minHold = clampHoldMs(options.holdMs);
+    const timeout = actionTimeoutMs(options);
+    const watch = options.untilGone !== undefined || options.untilVisible || options.untilText;
+
+    const box = await locator.boundingBox();
+    if (!box) throw new Error(`Cannot hold target: element has no bounding box (${state ? describeState(state) : raw}).`);
+
+    const page = tab.page;
+    const x = Math.round(box.x + box.width / 2);
+    const y = Math.round(box.y + box.height / 2);
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+
+    const started = Date.now();
+    const deadline = started + Math.max(minHold, timeout);
+    let heldMs = 0;
+    let condition = "hold";
+    try {
+      while (true) {
+        heldMs = Date.now() - started;
+        if (watch && (await holdConditionMet(frame, locator, options))) {
+          condition = holdConditionName(options);
+          break;
+        }
+        if (!watch && heldMs >= minHold) break;
+        if (heldMs >= deadline) {
+          condition = watch ? "timeout" : "hold";
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    } finally {
+      await page.mouse.up();
+    }
+
+    return { held: raw, mode, heldMs, condition, url: tab.page.url() };
+  });
+}
+
+async function testHoldTab(port, token, target, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+
+    const frame = await resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const raw = String(target || "").trim();
+    if (!raw) throw new Error("Hold target is required.");
+
+    const { locator, mode } = await resolveTargetLocator(frame, raw, {
+      tabId: tab.id,
+      frameUrl: frame.url(),
+      kind: "click",
+    });
+
+    const state = await elementState(locator);
+    if (state) {
+      if (state.disabled) throw new Error(`Cannot hold target: ${describeState(state)} is disabled.`);
+      if (!state.visible) throw new Error(`Cannot hold target: ${describeState(state)} is not visible.`);
+    }
+
+    const minHold = clampHoldMs(options.holdMs);
+    const timeout = actionTimeoutMs(options);
+
+    await frame.evaluate(installHoldObserver).catch(() => {});
+
+    const box = await locator.boundingBox();
+    if (!box) throw new Error(`Cannot hold target: element has no bounding box (${state ? describeState(state) : raw}).`);
+
+    const page = tab.page;
+    const x = Math.round(box.x + box.width / 2);
+    const y = Math.round(box.y + box.height / 2);
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+
+    const started = Date.now();
+    const deadline = started + Math.max(minHold, timeout);
+    let heldMs = 0;
+    let firstChangeAt = 0;
+    try {
+      while (true) {
+        heldMs = Date.now() - started;
+        const changed = await frame.evaluate(holdObserverCount).catch(() => 0);
+        if (changed > 0 && firstChangeAt === 0) firstChangeAt = heldMs;
+        if (firstChangeAt > 0 && heldMs >= firstChangeAt + 400) break;
+        if (firstChangeAt === 0 && heldMs >= minHold) break;
+        if (heldMs >= deadline) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    } finally {
+      await page.mouse.up();
+    }
+
+    const mutations = await frame.evaluate(readHoldMutations).catch(() => []);
+    return { held: raw, mode, heldMs, firstChangeAt, changed: mutations.length > 0, mutations, url: tab.page.url() };
+  });
+}
+
+function clampHoldMs(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) return 1500;
+  return Math.min(Math.max(ms, 50), 600000);
+}
+
+async function holdConditionMet(frame, locator, options) {
+  if (options.untilGone === "") {
+    return (await locator.count().catch(() => 0)) === 0;
+  }
+  if (options.untilGone) {
+    return (await frame.locator(options.untilGone).count().catch(() => 0)) === 0;
+  }
+  if (options.untilVisible) {
+    return frame.locator(options.untilVisible).first().isVisible().catch(() => false);
+  }
+  if (options.untilText) {
+    return frame
+      .evaluate((text) => Boolean(document.body && document.body.innerText.includes(text)), options.untilText)
+      .catch(() => false);
+  }
+  return false;
+}
+
+function holdConditionName(options) {
+  if (options.untilGone !== undefined) return "until-gone";
+  if (options.untilVisible) return "until-visible";
+  if (options.untilText) return "until-text";
+  return "hold";
+}
+
+function installHoldObserver() {
+  if (window.__pbcHoldObs) {
+    try { window.__pbcHoldObs.disconnect(); } catch (e) {}
+  }
+  window.__pbcHoldMuts = [];
+  const describe = (n) => {
+    if (!n) return "?";
+    if (n.nodeType === 8) return "comment";
+    if (n.nodeType === 3) return "text " + JSON.stringify(String(n.nodeValue || "").slice(0, 40));
+    const tag = String(n.tagName || "?").toLowerCase();
+    const id = n.id ? "#" + n.id : "";
+    let cls = "";
+    if (typeof n.className === "string" && n.className) {
+      cls = "." + n.className.trim().split(/\s+/).slice(0, 2).join(".");
+    }
+    const txt = String(n.textContent || "").trim().slice(0, 30);
+    return "<" + tag + id + cls + ">" + (txt ? " " + JSON.stringify(txt) : "");
+  };
+  const push = (line) => {
+    window.__pbcHoldMuts.push(line);
+    if (window.__pbcHoldMuts.length > 300) {
+      try { window.__pbcHoldObs.disconnect(); } catch (e) {}
+    }
+  };
+  const obs = new MutationObserver((muts) => {
+    for (const m of muts) {
+      if (m.type === "childList") {
+        for (const n of m.removedNodes) push("removed " + describe(n));
+        for (const n of m.addedNodes) if (n.nodeType === 1) push("added " + describe(n));
+      } else if (m.type === "characterData") {
+        push("text " + describe(m.target) + " => " + JSON.stringify(String(m.target.nodeValue || "").slice(0, 40)));
+      } else if (m.type === "attributes") {
+        let v = null;
+        try { v = m.target.getAttribute(m.attributeName); } catch (e) {}
+        push("attr " + describe(m.target) + " " + m.attributeName + "=" + JSON.stringify(v));
+      }
+    }
+  });
+  obs.observe(document.documentElement, {
+    subtree: true,
+    childList: true,
+    characterData: true,
+    attributes: true,
+  });
+  window.__pbcHoldObs = obs;
+  return true;
+}
+
+function holdObserverCount() {
+  return Array.isArray(window.__pbcHoldMuts) ? window.__pbcHoldMuts.length : 0;
+}
+
+function readHoldMutations() {
+  const arr = Array.isArray(window.__pbcHoldMuts) ? window.__pbcHoldMuts.slice() : [];
+  window.__pbcHoldMuts = [];
+  try { if (window.__pbcHoldObs) window.__pbcHoldObs.disconnect(); } catch (e) {}
+  const out = [];
+  for (const line of arr) {
+    if (out.length === 0 || out[out.length - 1] !== line) out.push(line);
+    if (out.length >= 40) break;
+  }
+  return out;
+}
+
+async function fillLocator(locator, value, options = {}) {
+  const timeout = actionTimeoutMs(options);
   try {
-    await locator.fill(value);
+    await locator.fill(value, { timeout });
     return "fill";
   } catch (error) {
     const tag = await locator.evaluate((node) => node.tagName.toLowerCase()).catch(() => "");
     if (tag !== "select") throw error;
 
     try {
-      await locator.selectOption({ label: value });
+      await locator.selectOption({ label: value }, { timeout });
       return "select-label";
     } catch {
-      await locator.selectOption(value);
+      await locator.selectOption(value, { timeout });
       return "select-value";
     }
+  }
+}
+
+async function fillLocatorFastFail(locator, value, options = {}) {
+  const state = await elementState(locator);
+  if (state) {
+    if (state.disabled) {
+      throw new Error(`Cannot fill target: ${describeState(state)} is disabled.`);
+    }
+    if (!state.visible) {
+      throw new Error(`Cannot fill target: ${describeState(state)} is not visible.`);
+    }
+  }
+  try {
+    return await fillLocator(locator, value, options);
+  } catch (error) {
+    const after = await elementState(locator);
+    const detail = after ? describeState(after) : "the target element is not in the DOM";
+    throw new Error(`Cannot fill target: ${detail}. ${error.message}`);
   }
 }
 
@@ -597,24 +1092,51 @@ async function fillTab(port, token, target, value, options = {}) {
     const raw = String(target || "").trim();
     if (!raw) throw new Error("Fill target is required.");
 
-    if (/^e\d+$/i.test(raw)) {
-      const ref = raw.toLowerCase();
-      const method = await fillLocator(frame.locator(`[data-pbc-ref="${ref}"]`).first(), value);
-      return { filled: ref, mode: "ref", method, url: tab.page.url() };
+    const { locator, mode } = await resolveTargetLocator(frame, raw, {
+      tabId: tab.id,
+      frameUrl: frame.url(),
+      kind: "input",
+    });
+    const method = await fillLocatorFastFail(locator, String(value), { timeoutMs: options.timeoutMs });
+
+    return { filled: raw, mode, method, url: tab.page.url() };
+  });
+}
+
+async function typeTab(port, token, target, value, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+
+    const frame = await resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const raw = String(target || "").trim();
+    if (!raw) throw new Error("Type target is required.");
+    const text = String(value == null ? "" : value);
+    const delayMs = clampDelay(options.delayMs);
+    const timeout = actionTimeoutMs(options);
+
+    const { locator, mode } = await resolveTargetLocator(frame, raw, {
+      tabId: tab.id,
+      frameUrl: frame.url(),
+      kind: "input",
+    });
+
+    if (options.clear) {
+      await locator.focus({ timeout });
+      await locator.press("ControlOrMeta+a", { timeout }).catch(() => {});
     }
 
-    if (looksLikeSelector(raw)) {
-      const method = await fillLocator(frame.locator(raw).first(), value);
-      return { filled: raw, mode: "selector", method, url: tab.page.url() };
-    }
+    await locator.pressSequentially(text, { delay: delayMs, timeout });
 
-    try {
-      const method = await fillLocator(frame.getByLabel(raw, { exact: false }).first(), value);
-      return { filled: raw, mode: "label", method, url: tab.page.url() };
-    } catch {
-      const method = await fillLocator(frame.getByPlaceholder(raw, { exact: false }).first(), value);
-      return { filled: raw, mode: "placeholder", method, url: tab.page.url() };
-    }
+    return {
+      typed: raw,
+      mode,
+      method: "pressSequentially",
+      delayMs,
+      clear: Boolean(options.clear),
+      url: tab.page.url(),
+    };
   });
 }
 
@@ -648,11 +1170,18 @@ async function evalTab(port, token, source, options = {}) {
 
     const value = await frame.evaluate(async (script) => {
       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-      try {
-        return await new AsyncFunction(`return (${script});`)();
-      } catch {
-        return await new AsyncFunction(script)();
+      let lastError;
+      for (const body of ["return (" + script + ");", script]) {
+        try {
+          return await new AsyncFunction(body)();
+        } catch (error) {
+          lastError = error;
+        }
       }
+      if (lastError instanceof SyntaxError) {
+        throw new Error("tab eval: inline JavaScript did not compile in the page. If you passed quotes inside the script from cmd.exe/PowerShell, the shell may have mangled them - use --base64 <b64> or --file <path> instead. Detail: " + (lastError && lastError.message));
+      }
+      throw lastError;
     }, source);
 
     return {
@@ -780,13 +1309,103 @@ async function saveAndCloseBrowser(port) {
   return { closedTabs, browserClose };
 }
 
+async function pressKey(port, token, key, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+    const frame = await resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+    const raw = String(key || "").trim();
+    if (!raw) throw new Error("Key is required.");
+    await tab.page.keyboard.press(raw);
+    return { pressed: raw, url: tab.page.url() };
+  });
+}
+
+async function listCdpTargets(port) {
+  const response = await fetch(`http://127.0.0.1:${port}/json`).catch(() => null);
+  if (!response || !response.ok) throw new Error(`CDP /json endpoint not reachable on port ${port}.`);
+  const targets = await response.json().catch(() => []);
+  return (targets || []).map((target) => ({
+    id: target.id,
+    type: target.type || "?",
+    url: target.url || "",
+    title: target.title || "",
+    webSocket: Boolean(target.webSocketDebuggerUrl),
+  }));
+}
+
+function killOversizedRenderers(thresholdGb = 2, profileMarker = "codex-tools\\pbc") {
+  const script = [
+    `$threshold = ${thresholdGb} * 1GB`,
+    `$marker = '${profileMarker}'`,
+    `$procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape($marker) -and $_.WorkingSetSize -gt $threshold }`,
+    `$procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue; Write-Output $_.ProcessId }`,
+  ].join("\r\n");
+  const { execSync } = require("child_process");
+  const os = require("os");
+  const path = require("path");
+  const fs = require("fs");
+  const tmp = path.join(os.tmpdir(), `pbc-heal-${process.pid}.ps1`);
+  try {
+    fs.writeFileSync(tmp, script, "utf8");
+    const out = execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tmp}"`, {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 20000,
+    });
+    return out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  } catch {
+    return [];
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+async function healStalledTabs(port, options = {}) {
+  const thresholdGb = Number(options.thresholdGb) > 0 ? Number(options.thresholdGb) : 2;
+  let connection;
+  try {
+    connection = await connectPages(port, { retries: 0 });
+  } catch (error) {
+    const killed = killOversizedRenderers(thresholdGb);
+    if (killed.length) {
+      await sleep(2500);
+      connection = await connectPages(port, { retries: 0 }).catch(() => null);
+      if (!connection) throw error;
+      return {
+        closed: killed.map((pid) => ({ id: pid, url: "(renderer pid killed)", closed: true })),
+        reconnect: true,
+      };
+    }
+    throw error;
+  }
+  try {
+    const targets = await listCdpTargets(port).catch(() => []);
+    const closed = [];
+    for (const tab of connection.tabs) {
+      if (!tab.stalled) continue;
+      const match = targets.find((target) => target.type === "page" && target.url === tab.url);
+      const ok = match ? await closeCdpTarget(port, match.id) : false;
+      closed.push({ id: tab.id, url: tab.url, closed: ok });
+    }
+    return { closed };
+  } finally {
+    await connection.browser.close().catch(() => {});
+  }
+}
+
 module.exports = {
   activateTab,
   clickTab,
   closeTab,
   evalTab,
   fillTab,
+  listCdpTargets,
+  healStalledTabs,
+  pressKey,
   gotoTab,
+  holdTab,
+  testHoldTab,
   inspectFields,
   isInternalTab,
   listFrames,
@@ -796,5 +1415,8 @@ module.exports = {
   screenshotTab,
   snapshotTab,
   textTab,
+  typeTab,
   reuseOrOpenTab,
+  resolveFrame,
+  withResolvedTab,
 };
