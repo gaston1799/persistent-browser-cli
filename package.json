@@ -1,33 +1,33 @@
-{
-  "name": "persistent-browser-cli",
-  "version": "0.1.7",
-  "description": "A Windows-focused CLI for driving a persistent Chrome profile over CDP and Playwright.",
-  "type": "commonjs",
-  "bin": {
-    "cli": "./cli.js",
-    "pbc": "./cli.js",
-    "pbc-cli": "./cli.js",
-    "persistent-browser-cli": "./cli.js"
-  },
-  "scripts": {
-    "help": "node cli.js --help",
-    "build:exe": "node scripts/build-exe.js"
-  },
-  "keywords": [
-    "chrome",
-    "playwright",
-    "cdp",
-    "browser",
-    "persistent-profile",
-    "automation"
-  ],
-  "license": "MIT",
-  "dependencies": {
-    "@playwright/cli": "^0.1.5",
-    "playwright-core": "^1.59.1"
-  },
-  "devDependencies": {
-    "esbuild": "^0.25.11",
-    "postject": "^1.0.0-alpha.6"
-  }
+﻿{
+    "name":  "persistent-browser-cli",
+    "version":  "0.2.0",
+    "description":  "A Windows-focused CLI for driving a persistent Chrome profile over CDP and Playwright.",
+    "type":  "commonjs",
+    "bin":  {
+                "cli":  "./cli.js",
+                "pbc":  "./cli.js",
+                "pbc-cli":  "./cli.js",
+                "persistent-browser-cli":  "./cli.js"
+            },
+    "scripts":  {
+                    "help":  "node cli.js --help",
+                    "build:exe":  "node scripts/build-exe.js"
+                },
+    "keywords":  [
+                     "chrome",
+                     "playwright",
+                     "cdp",
+                     "browser",
+                     "persistent-profile",
+                     "automation"
+                 ],
+    "license":  "MIT",
+    "dependencies":  {
+                         "@playwright/cli":  "^0.1.5",
+                         "playwright-core":  "^1.59.1"
+                     },
+    "devDependencies":  {
+                            "esbuild":  "^0.25.11",
+                            "postject":  "^1.0.0-alpha.6"
+                        }
 }
