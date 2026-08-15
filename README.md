@@ -1,5 +1,7 @@
 # persistent-browser-cli
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4%EF%B8%8F-red?style=flat-square&logo=github)](https://github.com/sponsors/gaston1799)
+
 A Windows-focused CLI for driving a persistent Chrome profile over CDP and Playwright.
 
 ## License And Branding
@@ -161,6 +163,7 @@ $env:PBC_DATA_ROOT = "$env:USERPROFILE\.codex\pbcDataDir"
 $env:PBC_USER_DATA_DIR = 'D:\browser-profiles\my-profile'
 $env:PBC_BACKUP_ROOT = 'D:\browser-profiles\backups'
 $env:PBC_CDP_PORT = '9333'
+$env:PBC_CDP_TIMEOUT_MS = '10000'
 $env:PBC_OPEN_TIMEOUT_MS = '120000'
 $env:PBC_PWCLI_SESSION = 'my-browser-session'
 ```
@@ -271,11 +274,23 @@ pbc tab snapshot active
 pbc tab text active
 pbc tab click active e3
 pbc tab fill active e7 "gaston@example.com"
+pbc tab type active e7 "747157"
+pbc tab hold active e0 --hold-ms 1200
+pbc tab test-hold active e0 --hold-ms 10000
 pbc tab screenshot active .\output\page.png
 pbc tab eval active "document.title"
 ```
 
 These commands attach to the Chrome instance started by `pbc open`, so they use the same logged-in persistent profile and the same tabs. They do not go through `pbc pw`.
+
+`pbc tab type` sends real keystrokes one at a time (`--delay-ms N`, default 40ms)
+and is the right tool for Svelte/React controlled inputs where `fill` alone does
+not update framework state; `--clear` empties the field before typing.
+`pbc tab text --include-values` appends non-password input values to the dump.
+Refs from `snapshot` are verified at action time: if a ref went stale the command
+fails fast (<5s) with a one-line diff (old vs new element) instead of looping on a
+30s actionability wait. Quoted URLs/args from cmd.exe have stray surrounding
+quotes stripped automatically.
 
 Trace a tab command when debugging browser automation:
 
@@ -332,6 +347,37 @@ pbc tab snapshot active --json
 pbc tab text active --json
 pbc tab screenshot active --full-page
 pbc tab eval active "Array.from(document.links).map(a => a.href)" --json
+```
+
+## Download-Safety And Risk Inspection
+
+For unfamiliar sites, use the native diagnostic commands before interacting with download buttons. They inspect the current browser session and redact cookies and authorization headers.
+
+```powershell
+pbc tab classify active --json
+pbc tab state active --json
+pbc tab unhide active --json
+pbc net watch active --install
+pbc net watch active --log --json
+pbc tab cert active --json
+pbc tab headers active --json
+```
+
+`tab state` summarizes Vue/React component keys, storage keys, and cookie names without returning cookie values. `tab unhide` only disables invisible pointer-intercepting overlays and closes native dialogs; it never enables disabled controls or forges task completion.
+
+To avoid PowerShell and cmd quoting problems, supply JavaScript or regular expressions through a file or base64 rather than raw inline source:
+
+```powershell
+pbc tab eval active --file .\inspect-page.js --json
+pbc tab grep-js active --pattern-file .\pattern.txt --json
+pbc tab state active --keys-file .\state-keys.txt --json
+```
+
+Use a separate clean profile for risky research:
+
+```powershell
+pbc profile clone --clean risky-download --open "https://example.com" --port 9224
+pbc tab classify active --port 9224 --json
 ```
 
 `snapshot` prints stable refs like `e0`, `e1`, `e2`. Use those refs immediately with `click` or `fill`. Re-run `snapshot` after navigation, reloads, or large DOM changes because refs can go stale.
