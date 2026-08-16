@@ -86,12 +86,19 @@ function requestBuffer(url) {
 }
 
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
-    cwd: options.cwd || process.cwd(),
-    stdio: options.stdio || "inherit",
-    windowsHide: true,
-    shell: false,
-  });
+  // On Windows, npm is npm.cmd — a batch shim that cannot be spawned with
+  // shell:false. Route .cmd/.bat commands through cmd.exe.
+  const win = process.platform === "win32";
+  const result = spawnSync(
+    win ? (process.env.ComSpec || "cmd.exe") : command,
+    win ? ["/d", "/s", "/c", command, ...args] : args,
+    {
+      cwd: options.cwd || process.cwd(),
+      stdio: options.stdio || "inherit",
+      windowsHide: true,
+      shell: false,
+    },
+  );
   if (result.error) throw result.error;
   return result.status ?? 1;
 }

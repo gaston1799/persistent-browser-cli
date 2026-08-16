@@ -516,7 +516,7 @@ async function updateSelf(checkOnly = false) {
   }
 
   console.log("[pbc] Pulling the latest tagged release into this checkout...");
-  const status = installRepo({ repoDir: ROOT });
+  const status = await installRepo({ repoDir: ROOT });
   if (status !== 0) {
     console.log(`[pbc] Update failed with exit code ${status}.`);
     return status;
