@@ -1140,6 +1140,86 @@ async function typeTab(port, token, target, value, options = {}) {
   });
 }
 
+async function uploadTab(port, token, target, filePaths, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+
+    const frame = await resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const raw = String(target || "").trim();
+    if (!raw) throw new Error("Upload target is required.");
+
+    const files = (Array.isArray(filePaths) ? filePaths : [filePaths])
+      .map((file) => String(file == null ? "" : file).trim())
+      .filter(Boolean)
+      .map((file) => path.resolve(file));
+    if (!files.length) throw new Error("At least one absolute file path is required.");
+
+    for (const file of files) {
+      let stat;
+      try {
+        stat = fs.statSync(file);
+      } catch {
+        throw new Error(`File not found: ${file}`);
+      }
+      if (!stat.isFile()) throw new Error(`Not a regular file: ${file}`);
+    }
+
+    const { locator, mode } = await resolveTargetLocator(frame, raw, {
+      tabId: tab.id,
+      frameUrl: frame.url(),
+      kind: "input",
+    });
+
+    try {
+      await locator.waitFor({ state: "attached", timeout: actionTimeoutMs(options) });
+    } catch {
+      throw new Error(`Upload target ${JSON.stringify(raw)} was not found in the page.`);
+    }
+
+    const state = await elementState(locator);
+    const tagType = state
+      ? { tag: state.tag, type: state.type }
+      : await locator
+          .evaluate((node) => ({
+            tag: String(node.tagName || "").toLowerCase(),
+            type: String((node.getAttribute && node.getAttribute("type")) || "").toLowerCase(),
+          }))
+          .catch(() => null);
+
+    if (!tagType || tagType.tag !== "input" || tagType.type !== "file") {
+      const detail = state ? describeState(state) : JSON.stringify(raw);
+      throw new Error(`Upload target is not an <input type="file">: ${detail}`);
+    }
+
+    const acceptsMultiple = await locator.evaluate((node) => Boolean(node.multiple)).catch(() => false);
+    if (files.length > 1 && !acceptsMultiple) {
+      throw new Error("The file input does not support multiple files; pass exactly one file path.");
+    }
+
+    const handle = await locator.elementHandle();
+    if (!handle) {
+      throw new Error(`Upload target ${JSON.stringify(raw)} could not be resolved to a DOM element.`);
+    }
+    const remote = handle._remoteObject || {};
+    const objectId = remote.objectId || remote.backendNodeId || remote.nodeId;
+    await handle.dispose().catch(() => {});
+    if (!objectId) {
+      throw new Error(`Upload target ${JSON.stringify(raw)} could not be resolved to a CDP node id.`);
+    }
+
+    const session = await tab.page.context().newCDPSession(frame);
+    try {
+      await session.send("DOM.setFileInputFiles", { files, objectId });
+    } finally {
+      await session.detach().catch(() => {});
+    }
+
+    return { uploaded: raw, mode, files, url: tab.page.url() };
+  });
+}
+
 async function screenshotTab(port, token, outputPath, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
     await ensureUsableViewport(tab.page);
@@ -1416,6 +1496,7 @@ module.exports = {
   snapshotTab,
   textTab,
   typeTab,
+  uploadTab,
   reuseOrOpenTab,
   resolveFrame,
   withResolvedTab,

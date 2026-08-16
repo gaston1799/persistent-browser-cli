@@ -275,6 +275,7 @@ pbc tab text active
 pbc tab click active e3
 pbc tab fill active e7 "gaston@example.com"
 pbc tab type active e7 "747157"
+pbc tab upload active e3 "C:\Users\Naqua\Desktop\a.png" "C:\Users\Naqua\Desktop\b.png"
 pbc tab hold active e0 --hold-ms 1200
 pbc tab test-hold active e0 --hold-ms 10000
 pbc tab screenshot active .\output\page.png
@@ -286,6 +287,9 @@ These commands attach to the Chrome instance started by `pbc open`, so they use 
 `pbc tab type` sends real keystrokes one at a time (`--delay-ms N`, default 40ms)
 and is the right tool for Svelte/React controlled inputs where `fill` alone does
 not update framework state; `--clear` empties the field before typing.
+`pbc tab upload` sets file input paths directly via CDP (`DOM.setFileInputFiles`),
+so the OS file picker is never shown. Pass one or more absolute paths; multiple
+files only work when the page's file input supports multiple files.
 `pbc tab text --include-values` appends non-password input values to the dump.
 Refs from `snapshot` are verified at action time: if a ref went stale the command
 fails fast (<5s) with a one-line diff (old vs new element) instead of looping on a

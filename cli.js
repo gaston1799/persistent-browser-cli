@@ -41,6 +41,7 @@ const {
   snapshotTab,
   textTab,
   typeTab,
+  uploadTab,
   reuseOrOpenTab,
 } = require("./tab_tools");
 const {
@@ -93,6 +94,7 @@ Usage:
   pbc tab test-hold <id|match|active> <ref|selector|text> [--hold-ms N] [--timeout-ms N] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab type <id|match|active> <ref|selector|label> <text> [--delay-ms N] [--clear] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab upload <id|match|active> <ref|selector|text> <absolute-file-path...> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab press <id|match|active> <key> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab screenshot <id|match|active> [path] [--full-page] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]
@@ -1389,6 +1391,28 @@ async function main() {
         clear: hasFlag("--clear", argv),
       }));
       console.log(`[pbc] Typed ${result.mode} ${JSON.stringify(result.typed)} using ${result.method} (delay=${result.delayMs}ms${result.clear ? ", cleared first" : ""}).`);
+      process.exit(0);
+    }
+
+    if (sub === "upload") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args[1];
+      const filePaths = args.slice(2);
+      const frame = readArg("--frame", argv);
+      if (!token || !target || filePaths.length === 0) {
+        console.log("Usage: pbc tab upload <id|match|active> <ref|selector|text> <absolute-file-path...> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-upload",
+        argv,
+      }, () => uploadTab(port, token, target, filePaths, { frame }));
+      console.log(`[pbc] Uploaded ${result.files.length} file(s) to ${result.mode} ${JSON.stringify(result.uploaded)} on ${result.url}`);
       process.exit(0);
     }
 
