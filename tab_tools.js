@@ -1198,25 +1198,232 @@ async function uploadTab(port, token, target, filePaths, options = {}) {
       throw new Error("The file input does not support multiple files; pass exactly one file path.");
     }
 
-    const handle = await locator.elementHandle();
-    if (!handle) {
-      throw new Error(`Upload target ${JSON.stringify(raw)} could not be resolved to a DOM element.`);
-    }
-    const remote = handle._remoteObject || {};
-    const objectId = remote.objectId || remote.backendNodeId || remote.nodeId;
-    await handle.dispose().catch(() => {});
-    if (!objectId) {
-      throw new Error(`Upload target ${JSON.stringify(raw)} could not be resolved to a CDP node id.`);
-    }
-
+    // Resolve the element to a CDP node entirely through the public CDP
+    // session API (playwright-core 1.59 no longer exposes handle internals):
+    // compute a stable CSS path via the locator, get the node's objectId with
+    // Runtime.evaluate, verify it is the expected <input type="file"> with
+    // DOM.describeNode, then set the paths with DOM.setFileInputFiles.
     const session = await tab.page.context().newCDPSession(frame);
     try {
+      const cssPath = await locator.evaluate((node) => {
+        if (!node || node.nodeType !== 1) return null;
+        if (node.id) return `#${CSS.escape(node.id)}`;
+        const parts = [];
+        let el = node;
+        while (el && el.nodeType === 1 && el !== document.documentElement) {
+          if (el.id) {
+            parts.unshift(`#${CSS.escape(el.id)}`);
+            break;
+          }
+          let part = el.tagName.toLowerCase();
+          if (el.parentElement) {
+            const same = Array.from(el.parentElement.children).filter((sibling) => sibling.tagName === el.tagName);
+            if (same.length > 1) part += `:nth-of-type(${same.indexOf(el) + 1})`;
+          }
+          parts.unshift(part);
+          el = el.parentElement;
+        }
+        return parts.join(" > ");
+      });
+      if (!cssPath) throw new Error(`Upload target ${JSON.stringify(raw)} could not be resolved to a CSS path.`);
+
+      const { result } = await session.send("Runtime.evaluate", {
+        expression: `document.querySelector(${JSON.stringify(cssPath)})`,
+        returnByValue: false,
+      });
+      const objectId = result && result.objectId;
+      if (!objectId) throw new Error(`Upload target ${JSON.stringify(raw)} could not be resolved to a CDP node id.`);
+
+      const nodeInfo = await session.send("DOM.describeNode", { objectId }).catch(() => null);
+      const nodeName = nodeInfo?.node ? String(nodeInfo.node.localName || nodeInfo.node.nodeName || "").toLowerCase() : "";
+      const attrs = nodeInfo?.node && Array.isArray(nodeInfo.node.attributes) ? nodeInfo.node.attributes : [];
+      let typeAttr = "";
+      for (let i = 0; i < attrs.length; i += 2) {
+        if (attrs[i] === "type") {
+          typeAttr = String(attrs[i + 1] || "").toLowerCase();
+          break;
+        }
+      }
+      if (nodeName !== "input" || typeAttr !== "file") {
+        throw new Error(
+          `Upload target ${JSON.stringify(raw)} is not an <input type="file">: resolved to <${nodeName}${typeAttr ? ` type=${typeAttr}` : ""}>.`
+        );
+      }
+
       await session.send("DOM.setFileInputFiles", { files, objectId });
     } finally {
       await session.detach().catch(() => {});
     }
 
     return { uploaded: raw, mode, files, url: tab.page.url() };
+  });
+}
+
+function pbcOutputDir() {
+  return path.join(__dirname, "output");
+}
+
+function safeDownloadName(value) {
+  const cleaned = String(value || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120);
+  return cleaned || "download.bin";
+}
+
+function filenameFromDisposition(disposition, url) {
+  if (disposition) {
+    const star = disposition.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;]+)/i);
+    if (star) {
+      try {
+        return safeDownloadName(decodeURIComponent(star[1].trim()));
+      } catch {}
+    }
+    const plain = disposition.match(/filename\s*=\s*"?([^";]+)"?/i);
+    if (plain) return safeDownloadName(plain[1].trim());
+  }
+  try {
+    const parsed = new URL(url);
+    const base = path.basename(decodeURIComponent(parsed.pathname));
+    if (base && base !== "/") return safeDownloadName(base);
+  } catch {}
+  return "download.bin";
+}
+
+async function fetchInPageAndSave(page, url, outputPath, timeoutMs) {
+  const result = await withTimeout(
+    page.evaluate(async (targetUrl) => {
+      const response = await fetch(targetUrl, { credentials: "include", redirect: "follow" });
+      const buffer = await response.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      let binary = "";
+      const chunkSize = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+      }
+      return {
+        status: response.status,
+        ok: response.ok,
+        bytes: bytes.length,
+        b64: btoa(binary),
+        contentType: response.headers.get("content-type") || "",
+        contentDisposition: response.headers.get("content-disposition") || "",
+        finalUrl: response.url || "",
+      };
+    }, url),
+    timeoutMs,
+    "download fetch"
+  );
+  if (!result.ok) throw new Error(`Download failed: HTTP ${result.status} for ${url}`);
+  const targetPath =
+    outputPath ||
+    path.join(pbcOutputDir(), "pbc-downloads", filenameFromDisposition(result.contentDisposition, result.finalUrl || url));
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.writeFileSync(targetPath, Buffer.from(result.b64, "base64"));
+  return {
+    method: "fetch",
+    filename: path.basename(targetPath),
+    path: targetPath,
+    bytes: result.bytes,
+    status: result.status,
+    contentType: result.contentType,
+  };
+}
+
+async function downloadTab(port, token, target, outputPath, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+
+    const frame = await resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const raw = String(target || "").trim();
+    if (!raw) throw new Error("Download target is required.");
+
+    const looksLikeUrl = /^(https?|file):\/\//i.test(raw);
+    const explicitOutput = outputPath ? path.resolve(outputPath) : null;
+    const timeoutMs = actionTimeoutMs(options);
+
+    if (looksLikeUrl) {
+      const saved = await fetchInPageAndSave(tab.page, raw, explicitOutput, timeoutMs);
+      return { downloaded: raw, mode: "url", ...saved, url: tab.page.url() };
+    }
+
+    const { locator } = await resolveTargetLocator(frame, raw, {
+      tabId: tab.id,
+      frameUrl: frame.url(),
+      kind: "click",
+    });
+
+    const href = await locator
+      .evaluate((node) => {
+        const anchor = node.closest ? node.closest("a") : null;
+        const hrefEl = anchor || (node.tagName === "A" ? node : null);
+        return {
+          href: (hrefEl && hrefEl.href) || node.href || node.src || "",
+          download: (hrefEl && hrefEl.getAttribute("download")) || "",
+        };
+      })
+      .catch(() => ({ href: "", download: "" }));
+
+    // Prefer the Playwright download event (JS-triggered downloads and
+    // Content-Disposition attachments); fall back to an in-page fetch of the
+    // resolved href (session cookies still apply) when no event fires.
+    const downloads = [];
+    const onDownload = (download) => downloads.push(download);
+    tab.page.on("download", onDownload);
+    let saved = null;
+    try {
+      await clickLocatorFastFail(locator, { timeoutMs });
+      if (downloads.length) {
+        const download = downloads[0];
+        const suggested = safeDownloadName(
+          download.suggestedFilename() || href.download || path.basename(href.href || "download.bin")
+        );
+        const targetPath = explicitOutput || path.join(pbcOutputDir(), "pbc-downloads", suggested);
+        const sourcePath = await download.path().catch(() => null);
+        if (sourcePath) {
+          fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+          fs.copyFileSync(sourcePath, targetPath);
+          saved = { method: "download", filename: suggested, path: targetPath, bytes: fs.statSync(targetPath).size };
+        }
+      }
+    } finally {
+      tab.page.off("download", onDownload);
+    }
+
+    if (!saved) {
+      if (!href.href) throw new Error(`Could not resolve a download URL from ${JSON.stringify(raw)}.`);
+      saved = await fetchInPageAndSave(tab.page, href.href, explicitOutput, timeoutMs);
+    }
+
+    return { downloaded: raw, mode: "link", ...saved, url: tab.page.url() };
+  });
+}
+
+async function pdfTab(port, token, outputPath, options = {}) {
+  return withResolvedTab(port, token, async (tab) => {
+    await ensureUsableViewport(tab.page);
+    const session = await tab.page.context().newCDPSession(tab.page);
+    let data;
+    try {
+      const result = await session.send("Page.printToPDF", {
+        printBackground: true,
+        preferCSSPageSize: options.preferCssPageSize === undefined ? true : Boolean(options.preferCssPageSize),
+        ...(options.landscape ? { landscape: true } : {}),
+        ...(options.scale ? { scale: Math.min(Math.max(Number(options.scale), 0.1), 2) } : {}),
+        ...(options.paperWidth ? { paperWidth: Number(options.paperWidth) } : {}),
+        ...(options.paperHeight ? { paperHeight: Number(options.paperHeight) } : {}),
+        ...(options.pages ? { pageRanges: String(options.pages) } : {}),
+      });
+      data = result.data;
+    } finally {
+      await session.detach().catch(() => {});
+    }
+    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+    fs.writeFileSync(outputPath, Buffer.from(data, "base64"));
+    return { path: outputPath, url: tab.page.url() };
   });
 }
 
@@ -1497,6 +1704,8 @@ module.exports = {
   textTab,
   typeTab,
   uploadTab,
+  downloadTab,
+  pdfTab,
   reuseOrOpenTab,
   resolveFrame,
   withResolvedTab,

@@ -132,6 +132,28 @@ async function waitUntilTab(port, token, target, options = {}) {
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
     const timeout = Math.min(Math.max(Number(options.timeout) || 30000, 250), 120000);
+
+    if (options.regex) {
+      let matcher;
+      try {
+        matcher = new RegExp(options.regex);
+      } catch (error) {
+        throw new Error(`Invalid --regex pattern: ${error.message}`);
+      }
+      await tab.page.waitForFunction(
+        (pattern) => new RegExp(pattern).test((document.body?.innerText || document.documentElement?.textContent || "")),
+        String(options.regex),
+        { timeout }
+      );
+      return {
+        tab: { id: tab.id, url: tab.page.url() },
+        target,
+        regex: String(options.regex),
+        enabled: Boolean(options.enabled),
+        timeout,
+      };
+    }
+
     const locator = looksLikeSelector(target) ? frame.locator(target).first() : frame.getByText(target, { exact: false }).first();
     await locator.waitFor({ state: "visible", timeout });
     if (options.enabled) {

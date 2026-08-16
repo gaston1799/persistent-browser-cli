@@ -276,6 +276,9 @@ pbc tab click active e3
 pbc tab fill active e7 "gaston@example.com"
 pbc tab type active e7 "747157"
 pbc tab upload active e3 "C:\Users\Naqua\Desktop\a.png" "C:\Users\Naqua\Desktop\b.png"
+pbc tab download active http://example.com/file.zip .\output\file.zip
+pbc tab download active "download binary" .\output\file.bin
+pbc tab pdf active .\output\page.pdf
 pbc tab hold active e0 --hold-ms 1200
 pbc tab test-hold active e0 --hold-ms 10000
 pbc tab screenshot active .\output\page.png
@@ -290,6 +293,13 @@ not update framework state; `--clear` empties the field before typing.
 `pbc tab upload` sets file input paths directly via CDP (`DOM.setFileInputFiles`),
 so the OS file picker is never shown. Pass one or more absolute paths; multiple
 files only work when the page's file input supports multiple files.
+`pbc tab download` fetches a URL in-page (session cookies apply) or clicks a
+link and captures the download; the output path is optional and defaults to
+`output\pbc-downloads\` with the server-provided filename.
+`pbc tab pdf` prints the current page to PDF over CDP (`Page.printToPDF`),
+optionally with `--landscape`, `--scale <n>`, `--paper-width <n>`, `--paper-height <n>`, and `--pages <ranges>`.
+`pbc tab wait-until --regex <pattern>` waits until the page text matches a
+regular expression, e.g. `pbc tab wait-until active "" --regex "order #[0-9]+ confirmed" --timeout 30000`.
 `pbc tab text --include-values` appends non-password input values to the dump.
 Refs from `snapshot` are verified at action time: if a ref went stale the command
 fails fast (<5s) with a one-line diff (old vs new element) instead of looping on a

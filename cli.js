@@ -24,6 +24,7 @@ const {
   activateTab,
   clickTab,
   closeTab,
+  downloadTab,
   evalTab,
   fillTab,
   gotoTab,
@@ -35,6 +36,7 @@ const {
   inspectFields,
   listFrames,
   listTabs,
+  pdfTab,
   pruneDuplicateTabs,
   saveAndCloseBrowser,
   screenshotTab,
@@ -95,6 +97,8 @@ Usage:
   pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab type <id|match|active> <ref|selector|label> <text> [--delay-ms N] [--clear] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab upload <id|match|active> <ref|selector|text> <absolute-file-path...> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab download <id|match|active> <url|ref|selector|text> [output-path] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab pdf <id|match|active> [path] [--landscape] [--scale <n>] [--paper-width <n>] [--paper-height <n>] [--pages <ranges>] [--port 9222]
   pbc tab press <id|match|active> <key> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab screenshot <id|match|active> [path] [--full-page] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]
@@ -104,7 +108,7 @@ Usage:
   pbc tab state <id|match|active> [--keys-file <regex-file>|--keys-base64 <base64-regex>] [--json] [--port 9222]
   pbc tab unhide <id|match|active> [--json] [--port 9222]
   pbc tab grep-js <id|match|active> --pattern-file <regex-file>|--pattern-base64 <base64-regex> [--chunks] [--json] [--port 9222]
-  pbc tab wait-until <id|match|active> <selector|text> [--enabled] [--timeout <ms>] [--frame <name-or-url>] [--json] [--port 9222]
+  pbc tab wait-until <id|match|active> <selector|text> [--regex <pattern>] [--enabled] [--timeout <ms>] [--frame <name-or-url>] [--json] [--port 9222]
   pbc tab cert <id|match|active> [--json] [--port 9222]
   pbc tab headers <id|match|active> [--json] [--port 9222]
   pbc tab prune [--port 9222] [--keep <id|match>]
@@ -172,7 +176,7 @@ function positionalArgs(argv) {
   const result = [];
   for (let i = 0; i < argv.length; i += 1) {
     const value = argv[i];
-    if (value === "--port" || value === "--frame" || value === "--keep" || value === "--match" || value === "--tab" || value === "--trace-dir" || value === "--file" || value === "--base64" || value === "--keys-file" || value === "--keys-base64" || value === "--pattern-file" || value === "--pattern-base64" || value === "--timeout" || value === "--delay-ms" || value === "--hold-ms" || value === "--until-gone" || value === "--until-visible" || value === "--until-text" || value === "--timeout-ms") {
+    if (value === "--port" || value === "--frame" || value === "--keep" || value === "--match" || value === "--tab" || value === "--trace-dir" || value === "--file" || value === "--base64" || value === "--keys-file" || value === "--keys-base64" || value === "--pattern-file" || value === "--pattern-base64" || value === "--timeout" || value === "--delay-ms" || value === "--hold-ms" || value === "--until-gone" || value === "--until-visible" || value === "--until-text" || value === "--timeout-ms" || value === "--regex" || value === "--scale" || value === "--paper-width" || value === "--paper-height" || value === "--pages") {
       i += 1;
       continue;
     }
@@ -610,6 +614,13 @@ function defaultScreenshotPath() {
   fs.mkdirSync(outDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return path.join(outDir, `pbc-screenshot-${stamp}.png`);
+}
+
+function defaultPdfPath() {
+  const outDir = path.join(ROOT, "output");
+  fs.mkdirSync(outDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return path.join(outDir, `pbc-${stamp}.pdf`);
 }
 
 function traceRoot() {
@@ -1087,10 +1098,11 @@ async function main() {
       const args = positionalArgs(argv.slice(2));
       const token = args[0];
       const target = args.slice(1).join(" ");
-      if (!token || !target) throw new Error("Usage: pbc tab wait-until <id|match|active> <selector|text> [--enabled] [--timeout <ms>] [--frame <name-or-url>] [--json] [--port 9222]");
-      const result = await waitUntilTab(port, token, target, { enabled: hasFlag("--enabled", argv), timeout: readArg("--timeout", argv), frame: readArg("--frame", argv) });
+      const regex = readArg("--regex", argv);
+      if (!token || (!target && !regex)) throw new Error("Usage: pbc tab wait-until <id|match|active> <selector|text> [--regex <pattern>] [--enabled] [--timeout <ms>] [--frame <name-or-url>] [--json] [--port 9222]");
+      const result = await waitUntilTab(port, token, target, { enabled: hasFlag("--enabled", argv), timeout: readArg("--timeout", argv), frame: readArg("--frame", argv), regex });
       if (hasFlag("--json", argv)) printJson(result);
-      else console.log(`[pbc] Ready: ${JSON.stringify(target)}`);
+      else console.log(`[pbc] Ready: ${JSON.stringify(regex ? `/${regex}/` : target)}`);
       process.exit(0);
     }
 
@@ -1413,6 +1425,48 @@ async function main() {
         argv,
       }, () => uploadTab(port, token, target, filePaths, { frame }));
       console.log(`[pbc] Uploaded ${result.files.length} file(s) to ${result.mode} ${JSON.stringify(result.uploaded)} on ${result.url}`);
+      process.exit(0);
+    }
+
+    if (sub === "download") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args[1];
+      const outputPath = args[2] ? path.resolve(args[2]) : null;
+      const frame = readArg("--frame", argv);
+      if (!token || !target) {
+        console.log("Usage: pbc tab download <id|match|active> <url|ref|selector|text> [output-path] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-download",
+        argv,
+      }, () => downloadTab(port, token, target, outputPath, { frame }));
+      console.log(`[pbc] Downloaded ${result.mode} via ${result.method}: ${result.path} (${result.bytes} bytes)`);
+      process.exit(0);
+    }
+
+    if (sub === "pdf") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const outputPath = path.resolve(args[1] || defaultPdfPath());
+      if (!token || token.startsWith("-")) {
+        console.log("Usage: pbc tab pdf <id|match|active> [path] [--landscape] [--scale <n>] [--paper-width <n>] [--paper-height <n>] [--pages <ranges>] [--port 9222]");
+        process.exit(1);
+      }
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+      const result = await pdfTab(port, token, outputPath, {
+        landscape: hasFlag("--landscape", argv),
+        scale: readArg("--scale", argv),
+        paperWidth: readArg("--paper-width", argv),
+        paperHeight: readArg("--paper-height", argv),
+        pages: readArg("--pages", argv),
+      });
+      console.log(`[pbc] PDF saved: ${result.path}`);
       process.exit(0);
     }
 
