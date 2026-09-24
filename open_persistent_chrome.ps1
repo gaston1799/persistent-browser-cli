@@ -2,7 +2,8 @@ param(
   [string]$Url = "https://example.com",
   [int]$RemoteDebuggingPort = 9222,
   [string]$ChromeExe,
-  [string]$UserDataDir
+  [string]$UserDataDir,
+  [string]$ChromeFlags = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +34,10 @@ $args = @(
   "--no-default-browser-check",
   $Url
 )
+
+if (![string]::IsNullOrWhiteSpace($ChromeFlags)) {
+  $args += $ChromeFlags.Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+}
 
 Start-Process -FilePath $ChromeExe -ArgumentList $args | Out-Null
 

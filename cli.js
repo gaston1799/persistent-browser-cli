@@ -5,12 +5,15 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
+const readline = require("node:readline/promises");
 const { spawnSync } = require("node:child_process");
 const {
   CHROME_EXE,
+  DATA_ROOT,
   DEFAULT_CDP_PORT,
   DEFAULT_PWCLI_SESSION,
   USER_DATA_DIR,
+  USER_DATA_DIR_IS_DEFAULT,
   BACKUP_ROOT,
 } = require("./config");
 const {
@@ -21,20 +24,38 @@ const {
   activateTab,
   clickTab,
   closeTab,
+  downloadTab,
   evalTab,
   fillTab,
   gotoTab,
+  listCdpTargets,
+  healStalledTabs,
+  pressKey,
+  holdTab,
+  testHoldTab,
   inspectFields,
   listFrames,
   listTabs,
+  pdfTab,
   pruneDuplicateTabs,
   saveAndCloseBrowser,
   screenshotTab,
   snapshotTab,
   textTab,
+  typeTab,
   uploadTab,
   reuseOrOpenTab,
 } = require("./tab_tools");
+const {
+  certificateTab,
+  classifyTab,
+  grepJsTab,
+  headersTab,
+  stateTab,
+  unhideTab,
+  waitUntilTab,
+  watchNetwork,
+} = require("./risk_tools");
 
 const ROOT = __dirname;
 const SELF_REPO = process.env.PBC_GITHUB_REPO || "gaston1799/persistent-browser-cli";
@@ -50,7 +71,7 @@ function usage(exitCode = 0) {
 persistent-browser-cli
 
 Usage:
-  pbc open [url] [--port 9222] [--reuse] [--match "<text>"] [--tab <id>]
+  pbc open [url] [--port 9222] [--reuse] [--match "<text>"] [--tab <id>] [--profile-source stable|beta|dev|canary|empty|<path>] [--no-profile-clone]
   pbc cdp [--port 9222]
   pbc doctor [--port 9222]
   pbc saveandclose [--port 9222]
@@ -58,30 +79,54 @@ Usage:
   pbc backup [--kill]
   pbc update [--check-only] [--port 9222]
   pbc install [--repo-url <url>] [--install-root <path>] [--link-global] [--clone-stable-chrome-profile]
-  pbc upload <ref|selector|text> <file> [more-files...] [--frame <name-or-url>] [--port 9222]
+  pbc profile clone --clean <name> [--open <url>] [--port 9224]
 
   pbc tab list [--all] [--port 9222]
+  pbc tab targets [--port 9222]
+  pbc tab heal [--threshold-gb N] [--port 9222]
   pbc tab activate <id|match> [--port 9222]
-  pbc tab goto <id|match|active> <url> [--port 9222]
+  pbc tab goto <id|match|active> <url> [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab close <id|match> [--port 9222]
   pbc tab frames <id|match|active> [--port 9222]
   pbc tab inspect <id|match|active> [--frame <name-or-url>] [--port 9222]
-  pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]
-  pbc tab text <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]
-  pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--port 9222]
-  pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--port 9222]
-  pbc tab upload <id|match|active> <ref|selector|text> <file> [more-files...] [--frame <name-or-url>] [--port 9222]
-  pbc tab screenshot <id|match|active> [path] [--full-page] [--port 9222]
-  pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--port 9222]
+  pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab text <id|match|active> [--frame <name-or-url>] [--include-values] [--json] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab hold <id|match|active> <ref|selector|text> [--hold-ms N] [--until-gone [<selector>]] [--until-visible <selector>] [--until-text <text>] [--timeout-ms N] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab test-hold <id|match|active> <ref|selector|text> [--hold-ms N] [--timeout-ms N] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab type <id|match|active> <ref|selector|label> <text> [--delay-ms N] [--clear] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab upload <id|match|active> <ref|selector|text> <absolute-file-path...> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab download <id|match|active> <url|ref|selector|text> [output-path] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab pdf <id|match|active> [path] [--landscape] [--scale <n>] [--paper-width <n>] [--paper-height <n>] [--pages <ranges>] [--port 9222]
+  pbc tab press <id|match|active> <key> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab screenshot <id|match|active> [path] [--full-page] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab eval <id|match|active> --file <javascript-file> [--frame <name-or-url>] [--json] [--port 9222]
+  pbc tab eval <id|match|active> --base64 <base64-javascript> [--frame <name-or-url>] [--json] [--port 9222]
+  pbc tab classify <id|match|active> [--json] [--port 9222]
+  pbc tab state <id|match|active> [--keys-file <regex-file>|--keys-base64 <base64-regex>] [--json] [--port 9222]
+  pbc tab unhide <id|match|active> [--json] [--port 9222]
+  pbc tab grep-js <id|match|active> --pattern-file <regex-file>|--pattern-base64 <base64-regex> [--chunks] [--json] [--port 9222]
+  pbc tab wait-until <id|match|active> <selector|text> [--regex <pattern>] [--enabled] [--timeout <ms>] [--frame <name-or-url>] [--json] [--port 9222]
+  pbc tab cert <id|match|active> [--json] [--port 9222]
+  pbc tab headers <id|match|active> [--json] [--port 9222]
   pbc tab prune [--port 9222] [--keep <id|match>]
+
+  pbc net watch <id|match|active> [--install|--log|--clear] [--json] [--port 9222]
+
+  pbc trace list
+  pbc trace latest
 
   pbc pw <playwright-cli args...>
 
 Environment overrides:
   PBC_CHROME_EXE
+  PBC_DATA_ROOT
   PBC_USER_DATA_DIR
   PBC_BACKUP_ROOT
   PBC_CDP_PORT
+  PBC_CDP_TIMEOUT_MS
   PBC_OPEN_TIMEOUT_MS
   PBC_PWCLI_SESSION
   PBC_GITHUB_REPO
@@ -89,6 +134,7 @@ Environment overrides:
 
 Defaults:
   chromeExe:   ${CHROME_EXE}
+  dataRoot:    ${DATA_ROOT}
   userDataDir: ${USER_DATA_DIR}
   backupRoot:  ${BACKUP_ROOT}
 `.trim();
@@ -96,33 +142,51 @@ Defaults:
   process.exit(exitCode);
 }
 
+function stripOuterQuotes(value) {
+  if (typeof value !== "string") return value;
+  let result = value;
+  while (result.length >= 2 && result.startsWith('"') && result.endsWith('"')) {
+    result = result.slice(1, -1);
+  }
+  return result;
+}
+
 function readArg(flag, argv) {
   const idx = argv.indexOf(flag);
   if (idx === -1) return null;
   const value = argv[idx + 1];
   if (!value || value.startsWith("-")) return null;
-  return value;
+  return stripOuterQuotes(value);
 }
 
 function hasFlag(flag, argv) {
   return argv.includes(flag);
 }
 
+function readTextInput(argv, fileFlag, base64Flag, label) {
+  const file = readArg(fileFlag, argv);
+  const encoded = readArg(base64Flag, argv);
+  if (file && encoded) throw new Error(`Use either ${fileFlag} or ${base64Flag}, not both.`);
+  if (file) return fs.readFileSync(path.resolve(file), "utf8");
+  if (encoded) return Buffer.from(encoded, "base64").toString("utf8");
+  throw new Error(`${label} is required. Use ${fileFlag} or ${base64Flag} to avoid shell quoting issues.`);
+}
+
 function positionalArgs(argv) {
   const result = [];
   for (let i = 0; i < argv.length; i += 1) {
     const value = argv[i];
-    if (value === "--port" || value === "--frame" || value === "--keep" || value === "--match" || value === "--tab") {
+    if (value === "--port" || value === "--frame" || value === "--keep" || value === "--match" || value === "--tab" || value === "--trace-dir" || value === "--file" || value === "--base64" || value === "--keys-file" || value === "--keys-base64" || value === "--pattern-file" || value === "--pattern-base64" || value === "--timeout" || value === "--delay-ms" || value === "--hold-ms" || value === "--until-gone" || value === "--until-visible" || value === "--until-text" || value === "--timeout-ms" || value === "--regex" || value === "--scale" || value === "--paper-width" || value === "--paper-height" || value === "--pages") {
       i += 1;
       continue;
     }
-    if (value === "--json" || value === "--full-page" || value === "--all" || value === "--reuse") {
+    if (value === "--json" || value === "--full-page" || value === "--all" || value === "--reuse" || value === "--trace" || value === "--enabled" || value === "--chunks" || value === "--clear" || value === "--include-values") {
       continue;
     }
     if (String(value || "").startsWith("--")) {
       continue;
     }
-    result.push(value);
+    result.push(stripOuterQuotes(value));
   }
   return result;
 }
@@ -155,6 +219,164 @@ function findCommand(command) {
 function getProfileLockFiles(userDataDir) {
   const names = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
   return names.filter((name) => fs.existsSync(path.join(userDataDir, name)));
+}
+
+function chromeChannels() {
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+  const programFiles = process.env.PROGRAMFILES || "C:\\Program Files";
+  const programFilesX86 = process.env["PROGRAMFILES(X86)"] || "C:\\Program Files (x86)";
+  return [
+    {
+      id: "stable",
+      label: "Google Chrome Stable",
+      exeCandidates: [
+        path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+        path.join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+        path.join(localAppData, "Google", "Chrome", "Application", "chrome.exe"),
+      ],
+      userDataDir: path.join(localAppData, "Google", "Chrome", "User Data"),
+    },
+    {
+      id: "beta",
+      label: "Google Chrome Beta",
+      exeCandidates: [
+        path.join(programFiles, "Google", "Chrome Beta", "Application", "chrome.exe"),
+        path.join(programFilesX86, "Google", "Chrome Beta", "Application", "chrome.exe"),
+        path.join(localAppData, "Google", "Chrome Beta", "Application", "chrome.exe"),
+      ],
+      userDataDir: path.join(localAppData, "Google", "Chrome Beta", "User Data"),
+    },
+    {
+      id: "dev",
+      label: "Google Chrome Dev",
+      exeCandidates: [
+        path.join(programFiles, "Google", "Chrome Dev", "Application", "chrome.exe"),
+        path.join(programFilesX86, "Google", "Chrome Dev", "Application", "chrome.exe"),
+        path.join(localAppData, "Google", "Chrome Dev", "Application", "chrome.exe"),
+      ],
+      userDataDir: path.join(localAppData, "Google", "Chrome Dev", "User Data"),
+    },
+    {
+      id: "canary",
+      label: "Google Chrome Canary",
+      exeCandidates: [
+        path.join(localAppData, "Google", "Chrome SxS", "Application", "chrome.exe"),
+        path.join(programFiles, "Google", "Chrome SxS", "Application", "chrome.exe"),
+      ],
+      userDataDir: path.join(localAppData, "Google", "Chrome SxS", "User Data"),
+    },
+  ].map((channel) => ({
+    ...channel,
+    exe: channel.exeCandidates.find((candidate) => fs.existsSync(candidate)) || channel.exeCandidates[0],
+    installed: channel.exeCandidates.some((candidate) => fs.existsSync(candidate)) || fs.existsSync(channel.userDataDir),
+    hasProfile: fs.existsSync(channel.userDataDir),
+  }));
+}
+
+function resolveProfileSource(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  if (/^empty$/i.test(raw)) return { mode: "empty" };
+  const channel = chromeChannels().find((candidate) => candidate.id === raw.toLowerCase());
+  if (channel) return { mode: "clone", ...channel };
+  return { mode: "clone", id: "custom", label: "Custom Chrome profile", userDataDir: path.resolve(raw), hasProfile: fs.existsSync(path.resolve(raw)) };
+}
+
+async function promptProfileSource(candidates) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
+  const choices = candidates.filter((candidate) => candidate.hasProfile);
+  const lines = [
+    "[pbc] No persistent profile exists at the default Codex profile path:",
+    `      ${USER_DATA_DIR}`,
+    "[pbc] Choose a Chrome profile to clone, or create an empty profile:",
+    ...choices.map((candidate, index) => `  ${index + 1}. ${candidate.label} (${candidate.userDataDir})`),
+    `  ${choices.length + 1}. Empty new profile`,
+    "",
+  ];
+  console.log(lines.join("\n"));
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(`Select 1-${choices.length + 1}: `);
+    const index = Number(answer);
+    if (!Number.isInteger(index) || index < 1 || index > choices.length + 1) {
+      throw new Error("Invalid profile selection.");
+    }
+    if (index === choices.length + 1) return { mode: "empty" };
+    return { mode: "clone", ...choices[index - 1] };
+  } finally {
+    rl.close();
+  }
+}
+
+function chromeProcessRunning() {
+  const result = spawnSync("tasklist.exe", ["/FI", "IMAGENAME eq chrome.exe"], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if ((result.status ?? 1) !== 0) return false;
+  return /chrome\.exe/i.test(String(result.stdout || ""));
+}
+
+function shouldCopyProfileEntry(source) {
+  const name = path.basename(source).toLowerCase();
+  if (name.startsWith("singleton")) return false;
+  if (["crashpad", "shadercache", "grshadercache", "pnacltranslationcache", "swreporter"].includes(name)) return false;
+  return true;
+}
+
+async function ensureDefaultProfile(argv) {
+  if (fs.existsSync(USER_DATA_DIR)) return;
+
+  if (!USER_DATA_DIR_IS_DEFAULT) {
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    return;
+  }
+
+  if (hasFlag("--no-profile-clone", argv)) {
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    console.log(`[pbc] Created empty persistent profile: ${USER_DATA_DIR}`);
+    return;
+  }
+
+  const explicitSource = readArg("--profile-source", argv);
+  let source = explicitSource ? resolveProfileSource(explicitSource) : null;
+  if (!source) source = await promptProfileSource(chromeChannels());
+
+  if (!source) {
+    const available = chromeChannels()
+      .filter((channel) => channel.hasProfile)
+      .map((channel) => `${channel.id}=${channel.userDataDir}`)
+      .join("; ");
+    throw new Error(
+      [
+        `Persistent profile is missing: ${USER_DATA_DIR}`,
+        "Run again with --profile-source stable|beta|dev|canary|empty|<path>, or run from an interactive terminal to choose.",
+        available ? `Detected profiles: ${available}` : "No existing Chrome user-data directories were detected.",
+      ].join("\n")
+    );
+  }
+
+  if (source.mode === "empty") {
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    console.log(`[pbc] Created empty persistent profile: ${USER_DATA_DIR}`);
+    return;
+  }
+
+  if (!source.hasProfile || !fs.existsSync(source.userDataDir)) {
+    throw new Error(`Chrome profile source not found: ${source.userDataDir}`);
+  }
+
+  if (chromeProcessRunning()) {
+    throw new Error(`Close Chrome before cloning a profile from ${source.userDataDir}`);
+  }
+
+  fs.mkdirSync(path.dirname(USER_DATA_DIR), { recursive: true });
+  console.log(`[pbc] Cloning ${source.label} profile into ${USER_DATA_DIR}`);
+  fs.cpSync(source.userDataDir, USER_DATA_DIR, {
+    recursive: true,
+    filter: shouldCopyProfileEntry,
+  });
 }
 
 async function isCdpUp(port) {
@@ -232,15 +454,6 @@ async function waitForOpenReady(port, requestedUrl, timeoutMs = 120000) {
   return false;
 }
 
-async function countCdpPageTargets(port) {
-  const response = await fetch(`http://127.0.0.1:${port}/json/list`);
-  if (!response.ok) {
-    throw new Error(`Could not read CDP target list on port ${port}.`);
-  }
-  const targets = await response.json();
-  return targets.filter((target) => target.type === "page").length;
-}
-
 function runPwsh(ps1, args = []) {
   const script = resolveScriptPath(ps1);
   const result = spawnSync(
@@ -307,7 +520,7 @@ async function updateSelf(checkOnly = false) {
   }
 
   console.log("[pbc] Pulling the latest tagged release into this checkout...");
-  const status = installRepo({ repoDir: ROOT });
+  const status = await installRepo({ repoDir: ROOT });
   if (status !== 0) {
     console.log(`[pbc] Update failed with exit code ${status}.`);
     return status;
@@ -403,6 +616,137 @@ function defaultScreenshotPath() {
   return path.join(outDir, `pbc-screenshot-${stamp}.png`);
 }
 
+function defaultPdfPath() {
+  const outDir = path.join(ROOT, "output");
+  fs.mkdirSync(outDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return path.join(outDir, `pbc-${stamp}.pdf`);
+}
+
+function traceRoot() {
+  return path.join(ROOT, "output", "pbc-traces");
+}
+
+function safeName(value) {
+  return String(value || "trace")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "trace";
+}
+
+function makeTraceDir(commandName, argv) {
+  const explicit = readArg("--trace-dir", argv);
+  if (explicit) {
+    const dir = path.resolve(explicit);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  fs.mkdirSync(traceRoot(), { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const base = path.join(traceRoot(), `${stamp}-${safeName(commandName)}`);
+  let dir = base;
+  let suffix = 1;
+  while (fs.existsSync(dir)) {
+    dir = `${base}-${suffix}`;
+    suffix += 1;
+  }
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function errorInfo(error) {
+  if (!error) return null;
+  return {
+    name: error.name || "Error",
+    message: error.message || String(error),
+    stack: error.stack || "",
+  };
+}
+
+async function captureTraceState(port, token, frame, dir, phase, options = {}) {
+  const state = { phase, capturedAt: new Date().toISOString(), errors: [] };
+  const screenshotPath = path.join(dir, `${phase}.png`);
+  const includeSnapshot = options.includeSnapshot !== false;
+
+  try {
+    const screenshot = await screenshotTab(port, token, screenshotPath, { fullPage: true });
+    state.screenshot = screenshot.path;
+    state.url = screenshot.url;
+  } catch (error) {
+    state.errors.push({ step: "screenshot", ...errorInfo(error) });
+  }
+
+  if (includeSnapshot) {
+    try {
+      const snapshot = await snapshotTab(port, token, { frame });
+      state.snapshot = snapshot;
+      fs.writeFileSync(path.join(dir, `${phase}-snapshot.json`), JSON.stringify(snapshot, null, 2));
+    } catch (error) {
+      state.errors.push({ step: "snapshot", ...errorInfo(error) });
+    }
+  }
+
+  try {
+    const text = await textTab(port, token, { frame });
+    state.text = { tab: text.tab, frame: text.frame, length: text.text.length };
+    fs.writeFileSync(path.join(dir, `${phase}-text.txt`), text.text);
+  } catch (error) {
+    state.errors.push({ step: "text", ...errorInfo(error) });
+  }
+
+  return state;
+}
+
+async function runWithTrace(options, action) {
+  const { enabled, port, token, frame, commandName, argv } = options;
+  if (!enabled) return await action();
+
+  const dir = makeTraceDir(commandName, argv);
+  const trace = {
+    command: commandName,
+    argv,
+    port,
+    token,
+    frame: frame || null,
+    startedAt: new Date().toISOString(),
+    traceDir: dir,
+    before: null,
+    after: null,
+    result: null,
+    error: null,
+  };
+
+  try {
+    trace.before = await captureTraceState(port, token, frame, dir, "before", { includeSnapshot: false });
+    const result = await action();
+    trace.result = result;
+    trace.after = await captureTraceState(port, token, frame, dir, "after");
+    return result;
+  } catch (error) {
+    trace.error = errorInfo(error);
+    trace.after = await captureTraceState(port, token, frame, dir, "after-error");
+    throw error;
+  } finally {
+    trace.finishedAt = new Date().toISOString();
+    fs.writeFileSync(path.join(dir, "trace.json"), JSON.stringify(trace, null, 2));
+    console.log(`[pbc] Trace saved: ${dir}`);
+  }
+}
+
+function listTraceDirs() {
+  if (!fs.existsSync(traceRoot())) return [];
+  return fs.readdirSync(traceRoot(), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => {
+      const fullPath = path.join(traceRoot(), entry.name);
+      const stat = fs.statSync(fullPath);
+      return { name: entry.name, path: fullPath, mtimeMs: stat.mtimeMs };
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   if (argv.length === 0) usage(0);
@@ -413,11 +757,12 @@ async function main() {
   const cmd = argv[0];
 
   if (cmd === "open") {
-    const url = argv[1] && !argv[1].startsWith("-") ? argv[1] : "https://example.com";
+    const url = argv[1] && !argv[1].startsWith("-") ? stripOuterQuotes(argv[1]) : "https://example.com";
     const port = Number(readArg("--port", argv) || DEFAULT_CDP_PORT);
     const reuse = hasFlag("--reuse", argv);
     const match = readArg("--match", argv);
     const tab = readArg("--tab", argv);
+    await ensureDefaultProfile(argv);
     const up = await isCdpUp(port);
     if (up) {
       const reused = await reuseOrOpenTab(port, url, {
@@ -438,6 +783,8 @@ async function main() {
       String(port),
       "-ChromeExe",
       CHROME_EXE,
+      "-ChromeFlags",
+      String(process.env.PBC_CHROME_FLAGS || ""),
       "-UserDataDir",
       USER_DATA_DIR,
     ]);
@@ -451,6 +798,33 @@ async function main() {
     }
 
     console.log(`CDP: UP (http://127.0.0.1:${port})`);
+    process.exit(0);
+  }
+
+  if (cmd === "profile") {
+    const sub = argv[1];
+    const name = argv[3];
+    if (sub !== "clone" || !hasFlag("--clean", argv) || !name || name.startsWith("-")) {
+      console.log("Usage: pbc profile clone --clean <name> [--open <url>] [--port 9224]");
+      process.exit(1);
+    }
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(name)) {
+      throw new Error("Profile name may contain only letters, numbers, underscores, and hyphens.");
+    }
+    const profileDir = path.join(DATA_ROOT, "profiles", "isolated", name);
+    fs.mkdirSync(profileDir, { recursive: true });
+    const url = readArg("--open", argv);
+    const port = Number(readArg("--port", argv) || 9224);
+    if (!url) {
+      printJson({ profile: profileDir, clean: true, port, next: `pbc profile clone --clean ${name} --open https://example.com --port ${port}` });
+      process.exit(0);
+    }
+    if (await isCdpUp(port)) throw new Error(`CDP port ${port} is already in use; choose a different --port.`);
+    const launchStatus = runPwsh("open_persistent_chrome.ps1", ["-Url", url, "-RemoteDebuggingPort", String(port), "-ChromeExe", CHROME_EXE, "-UserDataDir", profileDir, "-ChromeFlags", String(process.env.PBC_CHROME_FLAGS || "")]);
+    if (launchStatus !== 0) process.exit(launchStatus);
+    const ready = await waitForOpenReady(port, url, Number(process.env.PBC_OPEN_TIMEOUT_MS || 120000));
+    if (!ready) throw new Error(`Timed out waiting for isolated profile on CDP port ${port}.`);
+    printJson({ profile: profileDir, clean: true, port, url, cdp: `http://127.0.0.1:${port}` });
     process.exit(0);
   }
 
@@ -497,10 +871,10 @@ async function main() {
 
     if (cdpUp) {
       try {
-        const tabs = await countCdpPageTargets(port);
-        lines.push(formatInfo("open tabs", `${tabs}`));
+        const tabs = await listTabs(port, { includeInternal: true });
+        lines.push(formatInfo("open tabs", `${tabs.length} (enumerated over CDP, same path as commands)`));
       } catch (error) {
-        lines.push(formatStatus(false, "open tabs", error.message || String(error)));
+        lines.push(formatStatus(false, "open tabs", `CDP connect/enumerate failed: ${error.message || String(error)}`));
       }
     }
 
@@ -592,6 +966,55 @@ async function main() {
     process.exit(status);
   }
 
+  if (cmd === "trace") {
+    const sub = argv[1] || "list";
+    const traces = listTraceDirs();
+
+    if (sub === "list") {
+      if (!traces.length) {
+        console.log("[pbc] No traces found.");
+        process.exit(0);
+      }
+      for (const trace of traces.slice(0, 20)) {
+        console.log(`${trace.name} | ${trace.path}`);
+      }
+      process.exit(0);
+    }
+
+    if (sub === "latest") {
+      const latest = traces[0];
+      if (!latest) {
+        console.log("[pbc] No traces found.");
+        process.exit(1);
+      }
+      console.log(latest.path);
+      process.exit(0);
+    }
+
+    console.log("Usage: pbc trace list | latest");
+    process.exit(1);
+  }
+
+  if (cmd === "net") {
+    const sub = argv[1];
+    const token = argv[2];
+    const port = Number(readArg("--port", argv) || DEFAULT_CDP_PORT);
+    if (sub !== "watch" || !token || token.startsWith("-")) {
+      console.log("Usage: pbc net watch <id|match|active> [--install|--log|--clear] [--json] [--port 9222]");
+      process.exit(1);
+    }
+    if (!(await isCdpUp(port))) {
+      console.log(`CDP: DOWN (http://127.0.0.1:${port})`);
+      process.exit(2);
+    }
+    const actions = ["--install", "--clear"].filter((flag) => hasFlag(flag, argv));
+    if (actions.length > 1) throw new Error("Use only one of --install, --log, or --clear.");
+    const result = await watchNetwork(port, token, actions[0] === "--install" ? "install" : actions[0] === "--clear" ? "clear" : "log");
+    if (hasFlag("--json", argv)) printJson(result);
+    else console.log(JSON.stringify(result, null, 2));
+    process.exit(0);
+  }
+
   if (cmd === "tab") {
     const sub = argv[1];
     const port = Number(readArg("--port", argv) || DEFAULT_CDP_PORT);
@@ -610,6 +1033,97 @@ async function main() {
       process.exit(0);
     }
 
+    if (sub === "targets") {
+      const targets = await listCdpTargets(port);
+      for (const target of targets) {
+        console.log(`${target.type.padEnd(10)} ${target.url || "(no url)"}${target.webSocket ? "" : " (no ws)"}`);
+      }
+      process.exit(0);
+    }
+
+    if (sub === "heal") {
+      const result = await healStalledTabs(port, { thresholdGb: readArg("--threshold-gb", argv) });
+      const closedOk = result.closed.filter((c) => c.closed);
+      if (result.reconnect) {
+        console.log(`[pbc] Reconnected after killing ${closedOk.length} oversized renderer(s) (threshold ${readArg("--threshold-gb", argv) || 2}GB).`);
+        process.exit(0);
+      }
+      if (!closedOk.length) {
+        console.log("[pbc] No stalled tabs to heal.");
+        process.exit(0);
+      }
+      for (const c of closedOk) console.log(`[pbc] Closed stalled tab ${c.id} ${c.url.slice(0, 90)}`);
+      process.exit(0);
+    }
+
+    if (sub === "classify") {
+      const token = argv[2];
+      if (!token || token.startsWith("-")) throw new Error("Usage: pbc tab classify <id|match|active> [--json] [--port 9222]");
+      const result = await classifyTab(port, token);
+      if (hasFlag("--json", argv)) printJson(result);
+      else console.log(`${result.verdict.toUpperCase()}: ${result.reasons.join("; ") || "No known risk signatures."}\n${result.suggestedAction}`);
+      process.exit(0);
+    }
+
+    if (sub === "state") {
+      const token = argv[2];
+      if (!token || token.startsWith("-")) throw new Error("Usage: pbc tab state <id|match|active> [--keys-file <regex-file>|--keys-base64 <base64-regex>] [--json] [--port 9222]");
+      const keys = readArg("--keys-file", argv) || readArg("--keys-base64", argv) ? readTextInput(argv, "--keys-file", "--keys-base64", "keys pattern") : undefined;
+      const result = await stateTab(port, token, { keys });
+      if (hasFlag("--json", argv)) printJson(result);
+      else console.log(JSON.stringify(result, null, 2));
+      process.exit(0);
+    }
+
+    if (sub === "unhide") {
+      const token = argv[2];
+      if (!token || token.startsWith("-")) throw new Error("Usage: pbc tab unhide <id|match|active> [--json] [--port 9222]");
+      const result = await unhideTab(port, token);
+      if (hasFlag("--json", argv)) printJson(result);
+      else console.log(JSON.stringify(result, null, 2));
+      process.exit(0);
+    }
+
+    if (sub === "grep-js") {
+      const token = argv[2];
+      if (!token || token.startsWith("-")) throw new Error("Usage: pbc tab grep-js <id|match|active> --pattern-file <regex-file>|--pattern-base64 <base64-regex> [--chunks] [--json] [--port 9222]");
+      const pattern = readTextInput(argv, "--pattern-file", "--pattern-base64", "pattern").trim();
+      const result = await grepJsTab(port, token, pattern, { chunks: hasFlag("--chunks", argv) });
+      if (hasFlag("--json", argv)) printJson(result);
+      else console.log(JSON.stringify(result, null, 2));
+      process.exit(0);
+    }
+
+    if (sub === "wait-until") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args.slice(1).join(" ");
+      const regex = readArg("--regex", argv);
+      if (!token || (!target && !regex)) throw new Error("Usage: pbc tab wait-until <id|match|active> <selector|text> [--regex <pattern>] [--enabled] [--timeout <ms>] [--frame <name-or-url>] [--json] [--port 9222]");
+      const result = await waitUntilTab(port, token, target, { enabled: hasFlag("--enabled", argv), timeout: readArg("--timeout", argv), frame: readArg("--frame", argv), regex });
+      if (hasFlag("--json", argv)) printJson(result);
+      else console.log(`[pbc] Ready: ${JSON.stringify(regex ? `/${regex}/` : target)}`);
+      process.exit(0);
+    }
+
+    if (sub === "cert") {
+      const token = argv[2];
+      if (!token || token.startsWith("-")) throw new Error("Usage: pbc tab cert <id|match|active> [--json] [--port 9222]");
+      const result = await certificateTab(port, token);
+      if (hasFlag("--json", argv)) printJson(result);
+      else console.log(JSON.stringify(result, null, 2));
+      process.exit(0);
+    }
+
+    if (sub === "headers") {
+      const token = argv[2];
+      if (!token || token.startsWith("-")) throw new Error("Usage: pbc tab headers <id|match|active> [--json] [--port 9222]");
+      const result = await headersTab(port, token);
+      if (hasFlag("--json", argv)) printJson(result);
+      else console.log(JSON.stringify(result, null, 2));
+      process.exit(0);
+    }
+
     if (sub === "activate") {
       const token = argv[2];
       if (!token || token.startsWith("-")) {
@@ -623,12 +1137,19 @@ async function main() {
 
     if (sub === "goto") {
       const token = argv[2];
-      const url = argv[3];
+      const url = stripOuterQuotes(argv[3]);
       if (!token || token.startsWith("-") || !url || url.startsWith("-")) {
-        console.log("Usage: pbc tab goto <id|match|active> <url> [--port 9222]");
+        console.log("Usage: pbc tab goto <id|match|active> <url> [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const result = await gotoTab(port, token, url);
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame: null,
+        commandName: "tab-goto",
+        argv,
+      }, () => gotoTab(port, token, url));
       console.log(`[pbc] Reused tab [${result.id}] ${result.url}`);
       process.exit(0);
     }
@@ -641,6 +1162,11 @@ async function main() {
       }
       const result = await closeTab(port, token);
       console.log(`[pbc] Closed tab [${result.id}] ${result.url}`);
+      if (result.shifted && result.shifted.length > 0) {
+        console.log(
+          `[pbc] Note: ${result.shifted.length} open tab(s) had ids after [${result.id}] and will be renumbered (e.g. [${result.shifted[0].id}] gets a lower id). Run 'pbc tab list' for the current ids.`
+        );
+      }
       process.exit(0);
     }
 
@@ -696,10 +1222,17 @@ async function main() {
       const token = args[0];
       const frame = readArg("--frame", argv);
       if (!token || token.startsWith("-")) {
-        console.log("Usage: pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]");
+        console.log("Usage: pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const info = await snapshotTab(port, token, { frame });
+      const info = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-snapshot",
+        argv,
+      }, () => snapshotTab(port, token, { frame }));
       if (hasFlag("--json", argv)) printJson(info);
       else renderSnapshot(info);
       process.exit(0);
@@ -710,10 +1243,17 @@ async function main() {
       const token = args[0];
       const frame = readArg("--frame", argv);
       if (!token || token.startsWith("-")) {
-        console.log("Usage: pbc tab text <id|match|active> [--frame <name-or-url>] [--json] [--port 9222]");
+        console.log("Usage: pbc tab text <id|match|active> [--frame <name-or-url>] [--include-values] [--json] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const info = await textTab(port, token, { frame });
+      const info = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-text",
+        argv,
+      }, () => textTab(port, token, { frame, includeValues: hasFlag("--include-values", argv) }));
       if (hasFlag("--json", argv)) printJson(info);
       else {
         console.log(`[pbc] Frame: ${info.frame.name || "(no name)"} | ${info.frame.url}`);
@@ -728,11 +1268,93 @@ async function main() {
       const target = args.slice(1).join(" ");
       const frame = readArg("--frame", argv);
       if (!token || !target) {
-        console.log("Usage: pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--port 9222]");
+        console.log("Usage: pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const result = await clickTab(port, token, target, { frame });
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-click",
+        argv,
+      }, () => clickTab(port, token, target, { frame }));
       console.log(`[pbc] Clicked ${result.mode} ${JSON.stringify(result.clicked)}.`);
+      process.exit(0);
+    }
+
+    if (sub === "hold") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args.slice(1).join(" ");
+      const frame = readArg("--frame", argv);
+      const holdMs = readArg("--hold-ms", argv);
+      const untilGone = hasFlag("--until-gone", argv) ? (readArg("--until-gone", argv) || "") : undefined;
+      const untilVisible = readArg("--until-visible", argv);
+      const untilText = readArg("--until-text", argv);
+      const timeoutMs = readArg("--timeout-ms", argv);
+      if (!token || !target) {
+        console.log("Usage: pbc tab hold <id|match|active> <ref|selector|text> [--hold-ms N] [--until-gone [<selector>]] [--until-visible <selector>] [--until-text <text>] [--timeout-ms N] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-hold",
+        argv,
+      }, () => holdTab(port, token, target, { frame, holdMs, untilGone, untilVisible, untilText, timeoutMs }));
+      console.log(`[pbc] Held ${result.mode} ${JSON.stringify(result.held)} for ${result.heldMs}ms (${result.condition}).`);
+      process.exit(0);
+    }
+
+    if (sub === "test-hold") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args.slice(1).join(" ");
+      const frame = readArg("--frame", argv);
+      const holdMs = readArg("--hold-ms", argv);
+      const timeoutMs = readArg("--timeout-ms", argv);
+      if (!token || !target) {
+        console.log("Usage: pbc tab test-hold <id|match|active> <ref|selector|text> [--hold-ms N] [--timeout-ms N] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-test-hold",
+        argv,
+      }, () => testHoldTab(port, token, target, { frame, holdMs, timeoutMs }));
+      console.log(`[pbc] Test-held ${result.mode} ${JSON.stringify(result.held)} for ${result.heldMs}ms. Changes: ${result.changed ? result.mutations.length : 0}`);
+      if (result.changed) {
+        for (const line of result.mutations) console.log(`  - ${line}`);
+      } else {
+        console.log("  (no DOM changes observed)");
+      }
+      process.exit(0);
+    }
+
+    if (sub === "press") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const key = args.slice(1).join(" ");
+      const frame = readArg("--frame", argv);
+      if (!token || !key) {
+        console.log("Usage: pbc tab press <id|match|active> <key> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-press",
+        argv,
+      }, () => pressKey(port, token, key, { frame }));
+      console.log(`[pbc] Pressed ${JSON.stringify(result.pressed)} on ${result.url}`);
       process.exit(0);
     }
 
@@ -743,11 +1365,44 @@ async function main() {
       const value = args.slice(2).join(" ");
       const frame = readArg("--frame", argv);
       if (!token || !target || value.length === 0) {
-        console.log("Usage: pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--port 9222]");
+        console.log("Usage: pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const result = await fillTab(port, token, target, value, { frame });
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-fill",
+        argv,
+      }, () => fillTab(port, token, target, value, { frame }));
       console.log(`[pbc] Filled ${result.mode} ${JSON.stringify(result.filled)} using ${result.method}.`);
+      process.exit(0);
+    }
+
+    if (sub === "type") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args[1];
+      const value = args.slice(2).join(" ");
+      const frame = readArg("--frame", argv);
+      if (!token || !target || value.length === 0) {
+        console.log("Usage: pbc tab type <id|match|active> <ref|selector|label> <text> [--delay-ms N] [--clear] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-type",
+        argv,
+      }, () => typeTab(port, token, target, value, {
+        frame,
+        delayMs: readArg("--delay-ms", argv),
+        clear: hasFlag("--clear", argv),
+      }));
+      console.log(`[pbc] Typed ${result.mode} ${JSON.stringify(result.typed)} using ${result.method} (delay=${result.delayMs}ms${result.clear ? ", cleared first" : ""}).`);
       process.exit(0);
     }
 
@@ -755,14 +1410,63 @@ async function main() {
       const args = positionalArgs(argv.slice(2));
       const token = args[0];
       const target = args[1];
-      const files = args.slice(2);
+      const filePaths = args.slice(2);
       const frame = readArg("--frame", argv);
-      if (!token || !target || files.length === 0) {
-        console.log("Usage: pbc tab upload <id|match|active> <ref|selector|text> <file> [more-files...] [--frame <name-or-url>] [--port 9222]");
+      if (!token || !target || filePaths.length === 0) {
+        console.log("Usage: pbc tab upload <id|match|active> <ref|selector|text> <absolute-file-path...> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const result = await uploadTab(port, token, target, files, { frame });
-      console.log(`[pbc] Uploaded ${result.uploaded.length} file${result.uploaded.length === 1 ? "" : "s"} to ${result.mode} ${JSON.stringify(result.target)} using ${result.method}.`);
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-upload",
+        argv,
+      }, () => uploadTab(port, token, target, filePaths, { frame }));
+      console.log(`[pbc] Uploaded ${result.files.length} file(s) to ${result.mode} ${JSON.stringify(result.uploaded)} on ${result.url}`);
+      process.exit(0);
+    }
+
+    if (sub === "download") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args[1];
+      const outputPath = args[2] ? path.resolve(args[2]) : null;
+      const frame = readArg("--frame", argv);
+      if (!token || !target) {
+        console.log("Usage: pbc tab download <id|match|active> <url|ref|selector|text> [output-path] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-download",
+        argv,
+      }, () => downloadTab(port, token, target, outputPath, { frame }));
+      console.log(`[pbc] Downloaded ${result.mode} via ${result.method}: ${result.path} (${result.bytes} bytes)`);
+      process.exit(0);
+    }
+
+    if (sub === "pdf") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const outputPath = path.resolve(args[1] || defaultPdfPath());
+      if (!token || token.startsWith("-")) {
+        console.log("Usage: pbc tab pdf <id|match|active> [path] [--landscape] [--scale <n>] [--paper-width <n>] [--paper-height <n>] [--pages <ranges>] [--port 9222]");
+        process.exit(1);
+      }
+      fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+      const result = await pdfTab(port, token, outputPath, {
+        landscape: hasFlag("--landscape", argv),
+        scale: readArg("--scale", argv),
+        paperWidth: readArg("--paper-width", argv),
+        paperHeight: readArg("--paper-height", argv),
+        pages: readArg("--pages", argv),
+      });
+      console.log(`[pbc] PDF saved: ${result.path}`);
       process.exit(0);
     }
 
@@ -771,11 +1475,18 @@ async function main() {
       const token = args[0];
       const outputPath = path.resolve(args[1] || defaultScreenshotPath());
       if (!token || token.startsWith("-")) {
-        console.log("Usage: pbc tab screenshot <id|match|active> [path] [--full-page] [--port 9222]");
+        console.log("Usage: pbc tab screenshot <id|match|active> [path] [--full-page] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
       fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-      const result = await screenshotTab(port, token, outputPath, { fullPage: hasFlag("--full-page", argv) });
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame: null,
+        commandName: "tab-screenshot",
+        argv,
+      }, () => screenshotTab(port, token, outputPath, { fullPage: hasFlag("--full-page", argv) }));
       console.log(`[pbc] Screenshot saved: ${result.path}`);
       process.exit(0);
     }
@@ -783,13 +1494,23 @@ async function main() {
     if (sub === "eval") {
       const args = positionalArgs(argv.slice(2));
       const token = args[0];
-      const source = args.slice(1).join(" ");
+      const hasExternalSource = Boolean(readArg("--file", argv) || readArg("--base64", argv));
+      const source = hasExternalSource
+        ? readTextInput(argv, "--file", "--base64", "JavaScript source")
+        : args.slice(1).join(" ");
       const frame = readArg("--frame", argv);
       if (!token || !source) {
-        console.log("Usage: pbc tab eval <id|match|active> <javascript> [--frame <name-or-url>] [--json] [--port 9222]");
+        console.log("Usage: pbc tab eval <id|match|active> <javascript>|--file <javascript-file>|--base64 <base64-javascript> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]");
         process.exit(1);
       }
-      const result = await evalTab(port, token, source, { frame });
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        frame,
+        commandName: "tab-eval",
+        argv,
+      }, () => evalTab(port, token, source, { frame }));
       if (hasFlag("--json", argv)) printJson(result);
       else if (typeof result.value === "string") console.log(result.value);
       else printJson(result.value);
@@ -825,21 +1546,6 @@ async function main() {
       runPlaywrightCli(["snapshot"]);
     }
     process.exit(status);
-  }
-
-  if (cmd === "upload") {
-    const args = positionalArgs(argv.slice(1));
-    const port = Number(readArg("--port", argv) || DEFAULT_CDP_PORT);
-    const target = args[0];
-    const files = args.slice(1);
-    const frame = readArg("--frame", argv);
-    if (!target || files.length === 0) {
-      console.log("Usage: pbc upload <ref|selector|text> <file> [more-files...] [--frame <name-or-url>] [--port 9222]");
-      process.exit(1);
-    }
-    const result = await uploadTab(port, "active", target, files, { frame });
-    console.log(`[pbc] Uploaded ${result.uploaded.length} file${result.uploaded.length === 1 ? "" : "s"} to ${result.mode} ${JSON.stringify(result.target)} using ${result.method}.`);
-    process.exit(0);
   }
 
   usage(1);

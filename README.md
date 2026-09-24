@@ -1,6 +1,13 @@
 # persistent-browser-cli
 
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4%EF%B8%8F-red?style=flat-square&logo=github)](https://github.com/sponsors/gaston1799)
+
 A Windows-focused CLI for driving a persistent Chrome profile over CDP and Playwright.
+
+## License And Branding
+
+Code is licensed under the MIT license. The Persistent Browser CLI and PBC names
+are reserved trademarks; see `LICENSE` and `TRADEMARKS.md`.
 
 This repo is the reusable subset of the custom browser tooling:
 - launch Chrome with a persistent profile
@@ -142,9 +149,9 @@ By default the CLI uses:
 - Chrome executable:
   `C:\Program Files\Google\Chrome\Application\chrome.exe`
 - persistent profile dir:
-  `%LOCALAPPDATA%\persistent-browser-cli\profiles\default`
+  `%USERPROFILE%\.codex\pbcDataDir\profiles\default`
 - backup dir:
-  `%LOCALAPPDATA%\persistent-browser-cli\backups`
+  `%USERPROFILE%\.codex\pbcDataDir\backups`
 - CDP port:
   `9222`
 
@@ -152,9 +159,11 @@ You can override any of these with environment variables:
 
 ```powershell
 $env:PBC_CHROME_EXE = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+$env:PBC_DATA_ROOT = "$env:USERPROFILE\.codex\pbcDataDir"
 $env:PBC_USER_DATA_DIR = 'D:\browser-profiles\my-profile'
 $env:PBC_BACKUP_ROOT = 'D:\browser-profiles\backups'
 $env:PBC_CDP_PORT = '9333'
+$env:PBC_CDP_TIMEOUT_MS = '10000'
 $env:PBC_OPEN_TIMEOUT_MS = '120000'
 $env:PBC_PWCLI_SESSION = 'my-browser-session'
 ```
@@ -178,6 +187,21 @@ Open Chrome with the persistent profile:
 cd persistent-browser-cli
 node cli.js open https://mail.google.com
 ```
+
+If the default Codex profile directory does not exist, `pbc open` prompts you to clone an installed Chrome channel profile or create an empty profile. The clone target is stable across runs: `%USERPROFILE%\.codex\pbcDataDir\profiles\default`.
+
+Use flags to avoid the prompt:
+
+```powershell
+pbc open https://mail.google.com --profile-source stable
+pbc open https://mail.google.com --profile-source beta
+pbc open https://mail.google.com --profile-source dev
+pbc open https://mail.google.com --profile-source canary
+pbc open https://mail.google.com --profile-source empty
+pbc open https://mail.google.com --profile-source "D:\Chrome\User Data"
+```
+
+Close Chrome before cloning from an existing Chrome profile. Use `--no-profile-clone` to create an empty default profile without prompting.
 
 Log in normally in that Chrome window. When Chrome is closed cleanly, the login state remains in the profile directory.
 
@@ -250,11 +274,55 @@ pbc tab snapshot active
 pbc tab text active
 pbc tab click active e3
 pbc tab fill active e7 "gaston@example.com"
+pbc tab type active e7 "747157"
+pbc tab upload active e3 "C:\Users\Naqua\Desktop\a.png" "C:\Users\Naqua\Desktop\b.png"
+pbc tab download active http://example.com/file.zip .\output\file.zip
+pbc tab download active "download binary" .\output\file.bin
+pbc tab pdf active .\output\page.pdf
+pbc tab hold active e0 --hold-ms 1200
+pbc tab test-hold active e0 --hold-ms 10000
 pbc tab screenshot active .\output\page.png
 pbc tab eval active "document.title"
 ```
 
 These commands attach to the Chrome instance started by `pbc open`, so they use the same logged-in persistent profile and the same tabs. They do not go through `pbc pw`.
+
+`pbc tab type` sends real keystrokes one at a time (`--delay-ms N`, default 40ms)
+and is the right tool for Svelte/React controlled inputs where `fill` alone does
+not update framework state; `--clear` empties the field before typing.
+`pbc tab upload` sets file input paths directly via CDP (`DOM.setFileInputFiles`),
+so the OS file picker is never shown. Pass one or more absolute paths; multiple
+files only work when the page's file input supports multiple files.
+`pbc tab download` fetches a URL in-page (session cookies apply) or clicks a
+link and captures the download; the output path is optional and defaults to
+`output\pbc-downloads\` with the server-provided filename.
+`pbc tab pdf` prints the current page to PDF over CDP (`Page.printToPDF`),
+optionally with `--landscape`, `--scale <n>`, `--paper-width <n>`, `--paper-height <n>`, and `--pages <ranges>`.
+`pbc tab wait-until --regex <pattern>` waits until the page text matches a
+regular expression, e.g. `pbc tab wait-until active "" --regex "order #[0-9]+ confirmed" --timeout 30000`.
+`pbc tab text --include-values` appends non-password input values to the dump.
+Refs from `snapshot` are verified at action time: if a ref went stale the command
+fails fast (<5s) with a one-line diff (old vs new element) instead of looping on a
+30s actionability wait. Quoted URLs/args from cmd.exe have stray surrounding
+quotes stripped automatically.
+
+Trace a tab command when debugging browser automation:
+
+```powershell
+pbc tab click active e3 --trace
+pbc tab fill active e7 "gaston@example.com" --trace
+pbc tab eval active "document.title" --trace
+pbc trace latest
+pbc trace list
+```
+
+`--trace` writes a debugging bundle under `output\pbc-traces\...` by default. Each bundle includes `trace.json`, before/after screenshots, before/after page text, and after-command snapshots. The before capture intentionally skips a fresh snapshot so ref-based commands keep using the refs from your latest explicit `pbc tab snapshot`.
+
+Use `--trace-dir <path>` to choose an output folder:
+
+```powershell
+pbc tab click active e3 --trace --trace-dir .\output\my-trace
+```
 
 ## Smoke Test Proof
 
@@ -293,6 +361,37 @@ pbc tab snapshot active --json
 pbc tab text active --json
 pbc tab screenshot active --full-page
 pbc tab eval active "Array.from(document.links).map(a => a.href)" --json
+```
+
+## Download-Safety And Risk Inspection
+
+For unfamiliar sites, use the native diagnostic commands before interacting with download buttons. They inspect the current browser session and redact cookies and authorization headers.
+
+```powershell
+pbc tab classify active --json
+pbc tab state active --json
+pbc tab unhide active --json
+pbc net watch active --install
+pbc net watch active --log --json
+pbc tab cert active --json
+pbc tab headers active --json
+```
+
+`tab state` summarizes Vue/React component keys, storage keys, and cookie names without returning cookie values. `tab unhide` only disables invisible pointer-intercepting overlays and closes native dialogs; it never enables disabled controls or forges task completion.
+
+To avoid PowerShell and cmd quoting problems, supply JavaScript or regular expressions through a file or base64 rather than raw inline source:
+
+```powershell
+pbc tab eval active --file .\inspect-page.js --json
+pbc tab grep-js active --pattern-file .\pattern.txt --json
+pbc tab state active --keys-file .\state-keys.txt --json
+```
+
+Use a separate clean profile for risky research:
+
+```powershell
+pbc profile clone --clean risky-download --open "https://example.com" --port 9224
+pbc tab classify active --port 9224 --json
 ```
 
 `snapshot` prints stable refs like `e0`, `e1`, `e2`. Use those refs immediately with `click` or `fill`. Re-run `snapshot` after navigation, reloads, or large DOM changes because refs can go stale.
