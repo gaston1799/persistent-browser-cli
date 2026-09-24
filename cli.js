@@ -128,6 +128,7 @@ Environment overrides:
   PBC_CDP_PORT
   PBC_CDP_TIMEOUT_MS
   PBC_OPEN_TIMEOUT_MS
+  PBC_LAUNCH_TIMEOUT_MS
   PBC_PWCLI_SESSION
   PBC_GITHUB_REPO
   PBC_SKIP_UPDATE_CHECK
@@ -438,29 +439,117 @@ async function fetchCdpPageTargets(port) {
   return targets.filter((target) => target.type === "page");
 }
 
+// Chrome 111+ requires PUT for /json/new; older builds accept GET. Try both.
+async function createCdpPageTarget(port, url) {
+  const wanted = encodeURIComponent(url || "about:blank");
+  for (const method of ["PUT", "GET"]) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/new?${wanted}`, {
+        method,
+        signal: AbortSignal.timeout(4000),
+      });
+      if (response.ok) return await response.json();
+    } catch {
+      // Try the next method, then give up and let the caller report.
+    }
+  }
+  return null;
+}
+
+function describeOpenFailure(result, port, timeoutMs) {
+  const elapsed = Math.round(result?.elapsedMs ?? timeoutMs);
+  const base = `Could not open a usable page target at http://127.0.0.1:${port} after ${elapsed}ms`;
+  if (result?.reason === "no-page-targets") {
+    return `${base}: CDP is up but exposes zero page targets, which means a background or wedged Chrome is holding the profile and the launcher could not add a tab. Recover with \`pbc sac\`, close any leftover Chrome for this profile, then retry \`pbc open <url>\`.`;
+  }
+  if (result?.reason === "cdp-never-came-up") {
+    return `${base}: CDP never became reachable (waited up to ${timeoutMs}ms). Check that Chrome can launch and that the profile is not locked by another instance.`;
+  }
+  return `${base}: ${result?.pageTargets ?? 0} page target(s) present but none matched the requested URL.`;
+}
+
+// Polls until CDP exposes a page target matching the requested URL.
+// Returns { ok, reason, elapsedMs, recovered, pageTargets } so callers can
+// report *why* the wait failed instead of a generic timeout.
 async function waitForOpenReady(port, requestedUrl, timeoutMs = 120000) {
   const started = Date.now();
+  let cdpEverUp = false;
+  let zeroPageSince = null;
+  let recoveryAttempted = false;
+  let recovered = false;
+  let lastPageCount = 0;
+
   while (Date.now() - started < timeoutMs) {
+    let up = false;
+    let pageCount = 0;
     try {
-      if (await isCdpUp(port)) {
+      up = await isCdpUp(port);
+      if (up) {
+        cdpEverUp = true;
         const pages = await fetchCdpPageTargets(port);
-        if (pages.some((target) => targetMatchesOpenUrl(target, requestedUrl))) return true;
+        pageCount = pages.length;
+        lastPageCount = pageCount;
+        if (pages.some((target) => targetMatchesOpenUrl(target, requestedUrl))) {
+          return { ok: true, reason: "matched", elapsedMs: Date.now() - started, recovered, pageTargets: pageCount };
+        }
       }
     } catch {
       // Chrome can accept the version request before the target list is ready.
     }
+
+    // CDP answering with zero page targets for >2s means the launched browser
+    // never produced a tab. Recover by creating one over the CDP HTTP endpoint
+    // instead of burning the whole timeout, then fail fast with a real reason.
+    if (up && pageCount === 0) {
+      if (zeroPageSince === null) zeroPageSince = Date.now();
+      const zeroFor = Date.now() - zeroPageSince;
+      if (!recoveryAttempted && zeroFor >= 2000) {
+        recoveryAttempted = true;
+        const created = await createCdpPageTarget(port, requestedUrl);
+        if (created) {
+          console.error(`[pbc] CDP was up with no page targets; created one directly (${created.id || "new tab"}).`);
+          recovered = true;
+          const pages = await fetchCdpPageTargets(port).catch(() => []);
+          lastPageCount = pages.length;
+          if (pages.length) {
+            return { ok: true, reason: "recovered", elapsedMs: Date.now() - started, recovered, pageTargets: pages.length };
+          }
+        }
+      }
+      if (recoveryAttempted && zeroFor >= 6000) {
+        return { ok: false, reason: "no-page-targets", elapsedMs: Date.now() - started, recovered, pageTargets: 0 };
+      }
+    } else {
+      zeroPageSince = null;
+    }
+
     await sleep(500);
   }
-  return false;
+  return {
+    ok: false,
+    reason: cdpEverUp ? "no-matching-target" : "cdp-never-came-up",
+    elapsedMs: Date.now() - started,
+    recovered,
+    pageTargets: lastPageCount,
+  };
 }
 
 function runPwsh(ps1, args = []) {
   const script = resolveScriptPath(ps1);
+  const timeout = Number(process.env.PBC_LAUNCH_TIMEOUT_MS || 120000);
   const result = spawnSync(
     "powershell",
     ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, ...args],
-    { stdio: "inherit", cwd: ROOT }
+    { stdio: "inherit", cwd: ROOT, timeout, killSignal: "SIGKILL" }
   );
+  if (result.error && result.error.code === "ETIMEDOUT") {
+    console.error(`[pbc] Launcher ${path.basename(script)} exceeded ${timeout}ms and was killed. Set PBC_LAUNCH_TIMEOUT_MS to raise the limit.`);
+    return 2;
+  }
+  if (result.error) {
+    console.error(`[pbc] Failed to run ${path.basename(script)}: ${result.error.message}`);
+    return 2;
+  }
   return result.status ?? 1;
 }
 
@@ -765,14 +854,23 @@ async function main() {
     await ensureDefaultProfile(argv);
     const up = await isCdpUp(port);
     if (up) {
-      const reused = await reuseOrOpenTab(port, url, {
-        match,
-        token: tab,
-        reuseActive: reuse,
-      });
-      if (reused) {
-        console.log(`[pbc] ${reused.mode === "exact" ? "Focused existing tab" : "Reused tab"} [${reused.id}] ${reused.url}`);
-        process.exit(0);
+      try {
+        const reused = await reuseOrOpenTab(port, url, {
+          match,
+          token: tab,
+          reuseActive: reuse,
+        });
+        if (reused) {
+          console.log(`[pbc] ${reused.mode === "exact" ? "Focused existing tab" : "Reused tab"} [${reused.id}] ${reused.url}`);
+          process.exit(0);
+        }
+      } catch (error) {
+        // CDP answered the version probe but the browser target is unusable
+        // (wedged renderer, stale debug endpoint, crashed browser process).
+        // Fall through to a fresh launch instead of crashing, and let
+        // waitForOpenReady report a precise reason if that cannot help.
+        const reason = String((error && error.message) || error).split("\n")[0];
+        console.error(`[pbc] CDP at port ${port} is reachable but not usable (${reason}); attempting a fresh launch.`);
       }
     }
 
@@ -792,8 +890,8 @@ async function main() {
 
     const openTimeoutMs = Number(process.env.PBC_OPEN_TIMEOUT_MS || 120000);
     const ready = await waitForOpenReady(port, url, openTimeoutMs);
-    if (!ready) {
-      console.error(`[pbc] Timed out waiting for a usable CDP page target at http://127.0.0.1:${port}.`);
+    if (!ready.ok) {
+      console.error(`[pbc] ${describeOpenFailure(ready, port, openTimeoutMs)}`);
       process.exit(2);
     }
 
@@ -822,8 +920,9 @@ async function main() {
     if (await isCdpUp(port)) throw new Error(`CDP port ${port} is already in use; choose a different --port.`);
     const launchStatus = runPwsh("open_persistent_chrome.ps1", ["-Url", url, "-RemoteDebuggingPort", String(port), "-ChromeExe", CHROME_EXE, "-UserDataDir", profileDir, "-ChromeFlags", String(process.env.PBC_CHROME_FLAGS || "")]);
     if (launchStatus !== 0) process.exit(launchStatus);
-    const ready = await waitForOpenReady(port, url, Number(process.env.PBC_OPEN_TIMEOUT_MS || 120000));
-    if (!ready) throw new Error(`Timed out waiting for isolated profile on CDP port ${port}.`);
+    const openTimeoutMs = Number(process.env.PBC_OPEN_TIMEOUT_MS || 120000);
+    const ready = await waitForOpenReady(port, url, openTimeoutMs);
+    if (!ready.ok) throw new Error(describeOpenFailure(ready, port, openTimeoutMs));
     printJson({ profile: profileDir, clean: true, port, url, cdp: `http://127.0.0.1:${port}` });
     process.exit(0);
   }
@@ -1027,6 +1126,10 @@ async function main() {
       const tabs = await listTabs(port, { includeInternal: hasFlag("--all", argv) });
       if (!tabs.length) {
         console.log("[pbc] No tabs found.");
+        // CDP answered above, so zero tabs means a background/wedged Chrome is
+        // holding the profile with no page targets. Hint on stderr only, so
+        // stdout stays parseable for scripts.
+        console.error("[pbc] Note: CDP is up but exposes no page targets. Run `pbc open <url>` to create one, or `pbc sac` to reset the browser.");
         process.exit(0);
       }
       for (const tabInfo of tabs) console.log(tabInfo.label);

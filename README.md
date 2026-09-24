@@ -165,6 +165,7 @@ $env:PBC_BACKUP_ROOT = 'D:\browser-profiles\backups'
 $env:PBC_CDP_PORT = '9333'
 $env:PBC_CDP_TIMEOUT_MS = '10000'
 $env:PBC_OPEN_TIMEOUT_MS = '120000'
+$env:PBC_LAUNCH_TIMEOUT_MS = '120000'
 $env:PBC_PWCLI_SESSION = 'my-browser-session'
 ```
 
@@ -215,6 +216,10 @@ pbc open https://example.com --reuse
 ```
 
 `pbc open` polls every 500 ms until CDP exposes a usable page target before returning, so follow-up commands can be chained in the same one-liner. Set `PBC_OPEN_TIMEOUT_MS` if a very slow machine needs more than the default 120 seconds.
+
+If CDP is reachable but the browser exposes **no page targets** (a background or wedged Chrome still holding the profile), `pbc open` no longer waits out the whole timeout. It detects that state after about 2 seconds, creates a tab directly over the CDP HTTP endpoint (`PUT /json/new`, falling back to `GET`), and if that also fails it exits within about 6 seconds with a reason-specific message pointing at `pbc sac`. If CDP answers the version probe but the browser target is unusable, `pbc open` now falls through to a fresh launch instead of aborting with a raw Playwright stack trace.
+
+`PBC_LAUNCH_TIMEOUT_MS` (default 120000) bounds the Chrome launcher script, so a hung launcher is killed and reported rather than blocking forever.
 
 Check whether CDP is up:
 

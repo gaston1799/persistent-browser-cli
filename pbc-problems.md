@@ -1,5 +1,14 @@
 ﻿# pbc (persistent-browser-cli) â€” Problems Log
 
+## Changelog — 2026-09-23 fix pass
+
+| # | Status | Fix | How to verify |
+|---|--------|-----|---------------|
+| P14 | FIXED | `pbc open` no longer burns the full wait when CDP is up but exposes **zero page targets** (background/wedged Chrome holding the profile). `waitForOpenReady` detects the zero-target state after ~2s, recovers by creating a target over the CDP HTTP endpoint (`PUT /json/new`, GET fallback), and otherwise fails fast (~6s) with a reason-specific message instead of a generic timeout. Replaced the boolean return with `{ ok, reason, elapsedMs, recovered, pageTargets }` plus `describeOpenFailure()`. | Close the only page target while Chrome stays up (`CDP: UP`, 0 page targets), then run `pbc open <url>`: it recovers in ~2s, or fails in ~6s — never 120s. |
+| P15 | FIXED | `pbc open` aborted with a raw Playwright stack trace when CDP answered `/json/version` but the target was unusable (wedged renderer, stale debug endpoint). It now catches that, warns, and falls through to a fresh launch. | Point `--port` at an endpoint that answers `/json/version` but refuses the websocket: `pbc open <url> --port <p>` warns and exits non-zero cleanly instead of crashing. |
+| P16 | FIXED | `runPwsh` had no timeout, so `spawnSync` could block forever on a hung launcher script. Now bounded by `PBC_LAUNCH_TIMEOUT_MS` (default 120000) and reports the kill explicitly. | `set PBC_LAUNCH_TIMEOUT_MS=1` then `pbc open <url> --port <free-port>` → "Launcher ... exceeded 1ms and was killed", exit 2, no hang. |
+| P17 | FIXED | `pbc tab list` with zero tabs printed a bare `No tabs found.` and exit 0 even though CDP was reachable, hiding the wedged state. Now adds a stderr-only hint about how to recover (stdout unchanged, so scripts that parse it keep working). | In the zero-page-target state, `pbc tab list` prints `No tabs found.` on stdout and the hint on stderr. |
+
 ## Changelog â€” 2026-08-14 fix pass
 
 | # | Status | Fix | How to verify |
