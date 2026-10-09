@@ -105,12 +105,29 @@ async function connectPages(port, options = {}) {
       return { browser, tabs };
     } catch (error) {
       lastError = error;
-      if (browser) await browser.close().catch(() => {});
+      if (browser) await disconnectBrowser(browser).catch(() => {});
       if (attempt < maxAttempts) await sleep(250 * attempt);
     }
   }
 
   throw lastError;
+}
+
+async function disconnectBrowser(browser) {
+  if (!browser) return;
+  // connectOverCDP exposes Chrome's persistent context. A normal browser.close()
+  // sends Browser.close to Chrome, which shuts down the user-owned browser and
+  // causes its tabs to reload when the supervisor brings it back. Use
+  // Playwright's connection-only close path so this CLI detaches without
+  // closing the attached Chrome instance.
+  browser._shouldCloseConnectionOnClose = true;
+  // Playwright's built-in connection-only close path normally gets this event
+  // from its remote-browser connector. connectOverCDP does not wire it, so
+  // mirror that connector's local disconnected notification before closing.
+  browser._connection.once("close", () => {
+    setTimeout(() => browser._didClose(), 0);
+  });
+  await browser.close();
 }
 
 async function withResolvedTab(port, token, fn) {
@@ -119,7 +136,7 @@ async function withResolvedTab(port, token, fn) {
     const tab = resolveTab(tabs, token);
     return await fn(tab, browser);
   } finally {
-    await browser.close().catch(() => {});
+    await disconnectBrowser(browser).catch(() => {});
   }
 }
 
@@ -188,7 +205,7 @@ async function withResolvedTabList(port, options = {}) {
         label: formatTabLabel(tab),
       }));
   } finally {
-    await browser.close().catch(() => {});
+    await disconnectBrowser(browser).catch(() => {});
   }
 }
 
@@ -220,7 +237,7 @@ async function closeTab(port, token) {
     await tab.page.close({ runBeforeUnload: false });
     return { ...result, shifted };
   } finally {
-    await browser.close().catch(() => {});
+    await disconnectBrowser(browser).catch(() => {});
   }
 }
 
@@ -256,7 +273,7 @@ async function pruneDuplicateTabs(port, keepToken = null) {
 
     return closed;
   } finally {
-    await browser.close().catch(() => {});
+    await disconnectBrowser(browser).catch(() => {});
   }
 }
 
@@ -281,7 +298,7 @@ async function reuseOrOpenTab(port, url, options = {}) {
 
     return null;
   } finally {
-    await browser.close().catch(() => {});
+    await disconnectBrowser(browser).catch(() => {});
   }
 }
 
@@ -509,10 +526,12 @@ function saveRefsStore(store) {
 function persistTabRefs(tabId, frameUrl, items) {
   try {
     const store = loadRefsStore();
-    const key = String(tabId);
-    const entries = (store[key] || []).filter((entry) => entry.frameUrl !== frameUrl);
-    entries.push({ frameUrl, items, capturedAt: new Date().toISOString() });
-    store[key] = entries.slice(-10);
+    const keys = [String(tabId), `url:${frameUrl}`];
+    for (const key of keys) {
+      const entries = (store[key] || []).filter((entry) => entry.frameUrl !== frameUrl);
+      entries.push({ frameUrl, items, capturedAt: new Date().toISOString() });
+      store[key] = entries.slice(-10);
+    }
     saveRefsStore(store);
   } catch {
     // Best-effort optimization; never break snapshot over it.
@@ -522,7 +541,7 @@ function persistTabRefs(tabId, frameUrl, items) {
 function lookupRefSignature(tabId, frameUrl, ref) {
   try {
     const store = loadRefsStore();
-    const entries = store[String(tabId)] || [];
+    const entries = store[`url:${frameUrl}`] || store[String(tabId)] || [];
     const ordered = [...entries].reverse();
     const entry = ordered.find((candidate) => candidate.frameUrl === frameUrl) || ordered[0];
     if (!entry) return null;
@@ -604,8 +623,13 @@ async function resolveTargetLocator(frame, raw, options = {}) {
 
   if (/^e\d+$/i.test(trimmed)) {
     const ref = trimmed.toLowerCase();
-    const locator = frame.locator(`[data-pbc-ref="${ref}"]`).first();
     const expected = lookupRefSignature(tabId, frameUrl, ref);
+    // Snapshots must not annotate the live page: some SPAs (notably YouTube)
+    // observe DOM mutations and may re-render in response. Resolve refs through
+    // a structural XPath captured during the read-only snapshot instead.
+    const locator = expected?.selector
+      ? frame.locator(`xpath=${expected.selector}`).first()
+      : frame.locator(`[data-pbc-ref="${ref}"]`).first();
     if (expected) {
       const state = await elementState(locator);
       if (!state) {
@@ -672,94 +696,173 @@ function clampDelay(value) {
   return Math.min(Math.max(ms, 0), 5000);
 }
 
+async function listDirectPageTargets(port) {
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+  if (!response.ok) throw new Error(`Could not read CDP targets on port ${port}.`);
+  const targets = (await response.json()).filter((target) => target.type === "page");
+  return targets.map((target, index) => ({
+    id: String(index),
+    index,
+    url: target.url || "",
+    title: target.title || "",
+    active: false,
+    webSocketDebuggerUrl: target.webSocketDebuggerUrl || "",
+  }));
+}
+
+async function directPageEvaluate(target, expression) {
+  if (!target.webSocketDebuggerUrl) throw new Error("The selected page has no CDP websocket URL.");
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(target.webSocketDebuggerUrl);
+    let settled = false;
+    const timer = setTimeout(() => finish(new Error("Direct page evaluation timed out.")), cdpTimeoutMs());
+
+    function finish(error, value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      if (error) reject(error);
+      else resolve(value);
+    }
+
+    ws.addEventListener("open", () => {
+      ws.send(JSON.stringify({
+        id: 1,
+        method: "Runtime.evaluate",
+        params: { expression, returnByValue: true, awaitPromise: true },
+      }));
+    });
+    ws.addEventListener("message", (event) => {
+      try {
+        const message = JSON.parse(String(event.data || "{}"));
+        if (message.id !== 1) return;
+        if (message.error) return finish(new Error(message.error.message || "Direct page evaluation failed."));
+        if (message.result?.exceptionDetails) {
+          const detail = message.result.exceptionDetails.exception?.description || message.result.exceptionDetails.text;
+          return finish(new Error(detail || "Direct page evaluation threw an exception."));
+        }
+        finish(null, message.result?.result?.value);
+      } catch (error) {
+        finish(error);
+      }
+    });
+    ws.addEventListener("error", () => finish(new Error("Direct page CDP connection failed.")));
+  });
+}
+
+function collectSnapshotItemsInPage() {
+  const selector = [
+    "a",
+    "button",
+    "input",
+    "select",
+    "textarea",
+    "[role]",
+    "[contenteditable='true']",
+  ].join(",");
+
+  function getLabel(node) {
+    const aria = node.getAttribute("aria-label");
+    if (aria) return aria.trim();
+
+    const labelledBy = node.getAttribute("aria-labelledby");
+    if (labelledBy) {
+      const text = labelledBy
+        .split(/\s+/)
+        .map((id) => document.getElementById(id)?.textContent?.trim() || "")
+        .filter(Boolean)
+        .join(" ");
+      if (text) return text;
+    }
+
+    if (node.id) {
+      const label = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
+      if (label?.textContent) return label.textContent.trim();
+    }
+
+    const closest = node.closest("label");
+    if (closest?.textContent) return closest.textContent.trim();
+    return "";
+  }
+
+  function getXPath(node) {
+    const segments = [];
+    for (let current = node; current && current.nodeType === Node.ELEMENT_NODE; current = current.parentElement) {
+      let index = 1;
+      for (let sibling = current.previousElementSibling; sibling; sibling = sibling.previousElementSibling) {
+        if (sibling.tagName === current.tagName) index += 1;
+      }
+      segments.unshift(`${current.tagName.toLowerCase()}[${index}]`);
+    }
+    return `/${segments.join("/")}`;
+  }
+
+  return Array.from(document.querySelectorAll(selector))
+    .filter((node) => {
+      const style = window.getComputedStyle(node);
+      const rect = node.getBoundingClientRect();
+      return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+    })
+    .map((node, index) => {
+      const tag = node.tagName.toLowerCase();
+      const type = node.getAttribute("type") || "";
+      const role = node.getAttribute("role") || "";
+      const name = node.getAttribute("name") || "";
+      const id = node.id || "";
+      const aria = node.getAttribute("aria-label") || "";
+      const placeholder = node.getAttribute("placeholder") || "";
+      const text = (node.innerText || node.textContent || "").trim().replace(/\s+/g, " ").slice(0, 160);
+      const value = "value" in node ? String(node.value || "").slice(0, 160) : "";
+      const label = (getLabel(node) || aria || placeholder || text || value).replace(/\s+/g, " ").slice(0, 160);
+      return {
+        ref: `e${index}`,
+        selector: getXPath(node),
+        tag,
+        role,
+        type,
+        name,
+        id,
+        label,
+        text,
+        value,
+        disabled: Boolean(node.disabled || node.getAttribute("aria-disabled") === "true"),
+      };
+    });
+}
+
 async function snapshotTab(port, token, options = {}) {
+  if (!options.frame) {
+    const tabs = await listDirectPageTargets(port);
+    const tab = resolveTab(tabs, token);
+    const result = await directPageEvaluate(
+      tab,
+      `({items: (${collectSnapshotItemsInPage.toString()})(), title: document.title, url: location.href})`
+    );
+    const items = result?.items || [];
+    persistTabRefs(tab.id, result?.url || tab.url, items);
+    const publicItems = items.map(({ selector, ...item }) => item);
+    return {
+      tab: { id: tab.id, url: result?.url || tab.url, title: result?.title || tab.title },
+      frame: { name: "", url: result?.url || tab.url },
+      items: publicItems,
+    };
+  }
+
   return withResolvedTab(port, token, async (tab) => {
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
-    const items = await frame.evaluate(() => {
-      document.querySelectorAll("[data-pbc-ref]").forEach((node) => node.removeAttribute("data-pbc-ref"));
-      const selector = [
-        "a",
-        "button",
-        "input",
-        "select",
-        "textarea",
-        "[role]",
-        "[contenteditable='true']",
-      ].join(",");
-
-      function getLabel(node) {
-        const aria = node.getAttribute("aria-label");
-        if (aria) return aria.trim();
-
-        const labelledBy = node.getAttribute("aria-labelledby");
-        if (labelledBy) {
-          const text = labelledBy
-            .split(/\s+/)
-            .map((id) => document.getElementById(id)?.textContent?.trim() || "")
-            .filter(Boolean)
-            .join(" ");
-          if (text) return text;
-        }
-
-        if (node.id) {
-          const label = document.querySelector(`label[for="${CSS.escape(node.id)}"]`);
-          if (label?.textContent) return label.textContent.trim();
-        }
-
-        const closest = node.closest("label");
-        if (closest?.textContent) return closest.textContent.trim();
-
-        return "";
-      }
-
-      return Array.from(document.querySelectorAll(selector))
-        .filter((node) => {
-          const style = window.getComputedStyle(node);
-          const rect = node.getBoundingClientRect();
-          return (
-            style.visibility !== "hidden" &&
-            style.display !== "none" &&
-            rect.width > 0 &&
-            rect.height > 0
-          );
-        })
-        .map((node, index) => {
-          const tag = node.tagName.toLowerCase();
-          const type = node.getAttribute("type") || "";
-          const role = node.getAttribute("role") || "";
-          const name = node.getAttribute("name") || "";
-          const id = node.id || "";
-          const aria = node.getAttribute("aria-label") || "";
-          const placeholder = node.getAttribute("placeholder") || "";
-          const text = (node.innerText || node.textContent || "").trim().replace(/\s+/g, " ").slice(0, 160);
-          const value = "value" in node ? String(node.value || "").slice(0, 160) : "";
-          const label = (getLabel(node) || aria || placeholder || text || value).replace(/\s+/g, " ").slice(0, 160);
-
-          node.setAttribute("data-pbc-ref", `e${index}`);
-
-          return {
-            ref: `e${index}`,
-            tag,
-            role,
-            type,
-            name,
-            id,
-            label,
-            text,
-            value,
-            disabled: Boolean(node.disabled || node.getAttribute("aria-disabled") === "true"),
-          };
-        });
-    });
+    const items = await frame.evaluate(collectSnapshotItemsInPage);
 
     persistTabRefs(tab.id, frame.url(), items);
+
+    const publicItems = items.map(({ selector, ...item }) => item);
 
     return {
       tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) },
       frame: { name: frame.name() || "", url: frame.url() },
-      items,
+      items: publicItems,
     };
   });
 }
@@ -809,14 +912,42 @@ async function textTab(port, token, options = {}) {
 }
 
 async function clickTab(port, token, target, options = {}) {
+  const raw = String(target || "").trim();
+  if (!raw) throw new Error("Click target is required.");
+
+  if (!options.frame && /^e\d+$/i.test(raw)) {
+    const tabs = await listDirectPageTargets(port);
+    const tab = resolveTab(tabs, token);
+    const expected = lookupRefSignature(tab.id, tab.url, raw.toLowerCase());
+    if (!expected?.selector) {
+      throw new Error(`Ref ${raw.toLowerCase()} is not available. Run 'pbc tab snapshot' again and use a fresh ref.`);
+    }
+    const result = await directPageEvaluate(tab, `(() => {
+      const expected = ${JSON.stringify({ tag: expected.tag, id: expected.id, name: expected.name, type: expected.type })};
+      const node = document.evaluate(${JSON.stringify(expected.selector)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+      if (!node) return { error: "missing" };
+      const current = { tag: node.tagName.toLowerCase(), id: node.id || "", name: node.getAttribute("name") || "", type: node.getAttribute("type") || "" };
+      if (current.tag !== expected.tag || (expected.id && current.id !== expected.id) || (expected.name && current.name !== expected.name) || (expected.type && current.type !== expected.type)) {
+        return { error: "stale", current };
+      }
+      const style = getComputedStyle(node);
+      const rect = node.getBoundingClientRect();
+      if (node.disabled || node.getAttribute("aria-disabled") === "true") return { error: "disabled" };
+      if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return { error: "hidden" };
+      node.click();
+      return { clicked: true, url: location.href };
+    })()`);
+    if (result?.error) {
+      throw new Error(`Cannot click ref ${raw.toLowerCase()}: ${result.error}. Run 'pbc tab snapshot' again and use a fresh ref.`);
+    }
+    return { clicked: raw, mode: "ref-direct", url: result?.url || tab.url };
+  }
+
   return withResolvedTab(port, token, async (tab) => {
     await ensureUsableViewport(tab.page);
 
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
-
-    const raw = String(target || "").trim();
-    if (!raw) throw new Error("Click target is required.");
 
     const { locator, mode } = await resolveTargetLocator(frame, raw, {
       tabId: tab.id,
@@ -1677,7 +1808,7 @@ async function healStalledTabs(port, options = {}) {
     }
     return { closed };
   } finally {
-    await connection.browser.close().catch(() => {});
+    await disconnectBrowser(connection.browser).catch(() => {});
   }
 }
 

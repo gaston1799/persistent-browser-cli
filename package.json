@@ -1,4 +1,4 @@
-﻿{
+{
     "name":  "persistent-browser-cli",
     "version":  "0.2.0",
     "description":  "A Windows-focused CLI for driving a persistent Chrome profile over CDP and Playwright.",

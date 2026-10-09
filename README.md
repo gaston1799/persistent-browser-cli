@@ -99,6 +99,13 @@ Or from the CLI:
 pbc install --link-global --clone-stable-chrome-profile
 ```
 
+### Install the Codex skill
+
+The installable skill is in [`skills/pbc`](skills/pbc). From Codex, ask the
+skill installer to install `skills/pbc` from
+`gaston1799/persistent-browser-cli`. It provides PBC-specific command guidance,
+recovery rules, and safety boundaries while the CLI remains installed normally.
+
 Or with the bootstrapper:
 
 ```powershell
@@ -310,6 +317,14 @@ Refs from `snapshot` are verified at action time: if a ref went stale the comman
 fails fast (<5s) with a one-line diff (old vs new element) instead of looping on a
 30s actionability wait. Quoted URLs/args from cmd.exe have stray surrounding
 quotes stripped automatically.
+
+`snapshot` is read-only with respect to the page DOM. Main-frame snapshots use
+a lightweight direct page-CDP evaluation and keep their ref metadata outside
+the page, avoiding reloads in detach-sensitive applications such as YouTube
+Studio. Main-frame clicks by snapshot ref use the same direct path. Explicit
+iframe snapshots retain the Playwright path. Ref metadata is keyed by page URL
+as well as transient tab id so tab renumbering does not redirect a fresh ref to
+the wrong page.
 
 Trace a tab command when debugging browser automation:
 

@@ -148,6 +148,17 @@ Use this before pushing user-facing features:
 - `pbc tab screenshot`
 - `pbc sac`
 
+For snapshot changes, also test a mutation-sensitive SPA such as YouTube:
+
+1. Set a unique window property with `pbc tab eval` and record
+   `performance.timeOrigin`.
+2. Attach a `MutationObserver` filtered to the `data-pbc-ref` attribute.
+3. Run `pbc tab snapshot` at least three times.
+4. Verify the unique property and time origin are unchanged, the observer saw
+   zero matching mutations, and the page contains no `[data-pbc-ref]` nodes.
+5. Use one captured ref with `click` or `fill` to verify the out-of-page ref
+   index still resolves actions.
+
 ## Common Failure Modes
 
 - CDP down: run `pbc open <url>` first or check the configured port.
