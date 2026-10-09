@@ -1,0 +1,31 @@
+{
+  "name": "pbc",
+  "version": "0.3.0",
+  "description": "Control a persistent logged-in Chrome profile with the PBC command-line tool.",
+  "author": {
+    "name": "Gaston",
+    "url": "https://github.com/gaston1799"
+  },
+  "homepage": "https://github.com/gaston1799/persistent-browser-cli",
+  "repository": "https://github.com/gaston1799/persistent-browser-cli",
+  "license": "MIT",
+  "keywords": ["browser", "automation", "chrome", "cdp", "persistent-profile"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Persistent Browser CLI",
+    "shortDescription": "Control logged-in Chrome",
+    "longDescription": "Use PBC to inspect and automate a persistent Chrome profile through snapshots, stable element references, clicks, forms, uploads, downloads, screenshots, JavaScript evaluation, and tab management. The local PBC CLI is required.",
+    "developerName": "Gaston",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Persistent Chrome profile automation",
+      "Accessible page snapshots and stable refs",
+      "Form, upload, download, and tab control",
+      "Reload-safe main-frame inspection"
+    ],
+    "defaultPrompt": "Use PBC to inspect and interact with my current Chrome page.",
+    "websiteURL": "https://github.com/gaston1799/persistent-browser-cli",
+    "logo": "./assets/logo.svg",
+    "composerIcon": "./assets/composer-icon.svg"
+  }
+}
