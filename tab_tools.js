@@ -188,7 +188,17 @@ function resolveTab(tabs, token) {
 }
 
 async function listTabs(port, options = {}) {
-  return withResolvedTabList(port, options);
+  const tabs = await listDirectPageTargets(port);
+  const includeInternal = Boolean(options.includeInternal);
+  return tabs
+    .filter((tab) => includeInternal || !isInternalTab(tab))
+    .map((tab) => ({
+      id: tab.id,
+      url: tab.url,
+      title: tab.title,
+      active: false,
+      label: formatTabLabel(tab),
+    }));
 }
 
 async function withResolvedTabList(port, options = {}) {
@@ -703,6 +713,8 @@ async function listDirectPageTargets(port) {
   return targets.map((target, index) => ({
     id: String(index),
     index,
+    targetId: target.id || target.targetId || "",
+    port,
     url: target.url || "",
     title: target.title || "",
     active: false,
@@ -711,10 +723,15 @@ async function listDirectPageTargets(port) {
 }
 
 async function directPageEvaluate(target, expression) {
-  if (!target.webSocketDebuggerUrl) throw new Error("The selected page has no CDP websocket URL.");
+  if (!target.targetId) throw new Error("The selected page has no CDP target id.");
+  const response = await fetch(`http://127.0.0.1:${target.port}/json/version`);
+  if (!response.ok) throw new Error(`Could not read CDP version endpoint on port ${target.port}.`);
+  const version = await response.json();
+  if (!version.webSocketDebuggerUrl) throw new Error("The browser CDP websocket URL is missing.");
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(target.webSocketDebuggerUrl);
+    const ws = new WebSocket(version.webSocketDebuggerUrl);
     let settled = false;
+    let sessionId = "";
     const timer = setTimeout(() => finish(new Error("Direct page evaluation timed out.")), cdpTimeoutMs());
 
     function finish(error, value) {
@@ -729,14 +746,26 @@ async function directPageEvaluate(target, expression) {
     ws.addEventListener("open", () => {
       ws.send(JSON.stringify({
         id: 1,
-        method: "Runtime.evaluate",
-        params: { expression, returnByValue: true, awaitPromise: true },
+        method: "Target.attachToTarget",
+        params: { targetId: target.targetId, flatten: true },
       }));
     });
     ws.addEventListener("message", (event) => {
       try {
         const message = JSON.parse(String(event.data || "{}"));
-        if (message.id !== 1) return;
+        if (message.id === 1) {
+          if (message.error) return finish(new Error(message.error.message || "Could not attach to the page target."));
+          sessionId = message.result?.sessionId || "";
+          if (!sessionId) return finish(new Error("CDP did not return a page session id."));
+          ws.send(JSON.stringify({
+            id: 2,
+            sessionId,
+            method: "Runtime.evaluate",
+            params: { expression, returnByValue: true, awaitPromise: true },
+          }));
+          return;
+        }
+        if (message.id !== 2) return;
         if (message.error) return finish(new Error(message.error.message || "Direct page evaluation failed."));
         if (message.result?.exceptionDetails) {
           const detail = message.result.exceptionDetails.exception?.description || message.result.exceptionDetails.text;
@@ -1582,6 +1611,34 @@ async function screenshotTab(port, token, outputPath, options = {}) {
 }
 
 async function evalTab(port, token, source, options = {}) {
+  if (!options.frame) {
+    const tabs = await listDirectPageTargets(port);
+    const tab = resolveTab(tabs, token);
+    const expression = `(async () => {
+      const script = ${JSON.stringify(source)};
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      let lastError;
+      for (const body of ["return (" + script + ");", script]) {
+        try {
+          const value = await new AsyncFunction(body)();
+          return { value, url: location.href, title: document.title };
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (lastError instanceof SyntaxError) {
+        throw new Error("tab eval: inline JavaScript did not compile in the page. If you passed quotes inside the script from cmd.exe/PowerShell, the shell may have mangled them - use --base64 <b64> or --file <path> instead. Detail: " + (lastError && lastError.message));
+      }
+      throw lastError;
+    })()`;
+    const result = await directPageEvaluate(tab, expression);
+    return {
+      tab: { id: tab.id, url: result?.url || tab.url, title: result?.title || tab.title },
+      frame: { name: "", url: result?.url || tab.url },
+      value: result?.value,
+    };
+  }
+
   return withResolvedTab(port, token, async (tab) => {
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
