@@ -722,7 +722,7 @@ async function listDirectPageTargets(port) {
   }));
 }
 
-async function directPageEvaluate(target, expression) {
+async function withDirectPageSession(target, fn) {
   if (!target.targetId) throw new Error("The selected page has no CDP target id.");
   const response = await fetch(`http://127.0.0.1:${target.port}/json/version`);
   if (!response.ok) throw new Error(`Could not read CDP version endpoint on port ${target.port}.`);
@@ -732,51 +732,99 @@ async function directPageEvaluate(target, expression) {
     const ws = new WebSocket(version.webSocketDebuggerUrl);
     let settled = false;
     let sessionId = "";
-    const timer = setTimeout(() => finish(new Error("Direct page evaluation timed out.")), cdpTimeoutMs());
+    let nextId = 1;
+    const pending = new Map();
+    const timer = setTimeout(() => finish(new Error("Direct page CDP session timed out.")), cdpTimeoutMs());
 
     function finish(error, value) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      for (const waiter of pending.values()) waiter.reject(error || new Error("Direct page CDP session closed."));
+      pending.clear();
       try { ws.close(); } catch {}
       if (error) reject(error);
       else resolve(value);
     }
 
-    ws.addEventListener("open", () => {
-      ws.send(JSON.stringify({
-        id: 1,
-        method: "Target.attachToTarget",
-        params: { targetId: target.targetId, flatten: true },
-      }));
+    function send(method, params = {}, useSession = true) {
+      return new Promise((resolveMessage, rejectMessage) => {
+        const id = nextId++;
+        pending.set(id, { resolve: resolveMessage, reject: rejectMessage });
+        ws.send(JSON.stringify({ id, method, params, ...(useSession && sessionId ? { sessionId } : {}) }));
+      });
+    }
+
+    ws.addEventListener("open", async () => {
+      try {
+        const attached = await send("Target.attachToTarget", { targetId: target.targetId, flatten: true }, false);
+        sessionId = attached?.sessionId || "";
+        if (!sessionId) throw new Error("CDP did not return a page session id.");
+        finish(null, await fn((method, params) => send(method, params, true)));
+      } catch (error) {
+        finish(error);
+      }
     });
     ws.addEventListener("message", (event) => {
       try {
         const message = JSON.parse(String(event.data || "{}"));
-        if (message.id === 1) {
-          if (message.error) return finish(new Error(message.error.message || "Could not attach to the page target."));
-          sessionId = message.result?.sessionId || "";
-          if (!sessionId) return finish(new Error("CDP did not return a page session id."));
-          ws.send(JSON.stringify({
-            id: 2,
-            sessionId,
-            method: "Runtime.evaluate",
-            params: { expression, returnByValue: true, awaitPromise: true },
-          }));
-          return;
-        }
-        if (message.id !== 2) return;
-        if (message.error) return finish(new Error(message.error.message || "Direct page evaluation failed."));
-        if (message.result?.exceptionDetails) {
-          const detail = message.result.exceptionDetails.exception?.description || message.result.exceptionDetails.text;
-          return finish(new Error(detail || "Direct page evaluation threw an exception."));
-        }
-        finish(null, message.result?.result?.value);
+        if (!message.id || !pending.has(message.id)) return;
+        const waiter = pending.get(message.id);
+        pending.delete(message.id);
+        if (message.error) waiter.reject(new Error(message.error.message || "Direct page CDP command failed."));
+        else waiter.resolve(message.result);
       } catch (error) {
         finish(error);
       }
     });
     ws.addEventListener("error", () => finish(new Error("Direct page CDP connection failed.")));
+  });
+}
+
+async function directPageEvaluate(target, expression) {
+  const evaluation = await withDirectPageSession(target, (send) =>
+    send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true })
+  );
+  if (evaluation?.exceptionDetails) {
+    const detail = evaluation.exceptionDetails.exception?.description || evaluation.exceptionDetails.text;
+    throw new Error(detail || "Direct page evaluation threw an exception.");
+  }
+  return evaluation?.result?.value;
+}
+
+async function directPageSetFileInputFiles(target, expression, files) {
+  return withDirectPageSession(target, async (send) => {
+    const evaluation = await send("Runtime.evaluate", {
+      expression,
+      returnByValue: false,
+      awaitPromise: true,
+    });
+    if (evaluation?.exceptionDetails) {
+      const detail = evaluation.exceptionDetails.exception?.description || evaluation.exceptionDetails.text;
+      throw new Error(detail || "Upload target resolution threw an exception.");
+    }
+    const objectId = evaluation?.result?.objectId;
+    if (!objectId) throw new Error("Upload target could not be resolved to a CDP node.");
+
+    const nodeInfo = await send("DOM.describeNode", { objectId });
+    const node = nodeInfo?.node;
+    const nodeName = String(node?.localName || node?.nodeName || "").toLowerCase();
+    const attrs = Array.isArray(node?.attributes) ? node.attributes : [];
+    let typeAttr = "";
+    let acceptsMultiple = false;
+    for (let index = 0; index < attrs.length; index += 2) {
+      if (attrs[index] === "type") typeAttr = String(attrs[index + 1] || "").toLowerCase();
+      if (attrs[index] === "multiple") acceptsMultiple = true;
+    }
+    if (nodeName !== "input" || typeAttr !== "file") {
+      throw new Error(`Upload target is not an <input type="file">: resolved to <${nodeName}${typeAttr ? ` type=${typeAttr}` : ""}>.`);
+    }
+    if (files.length > 1 && !acceptsMultiple) {
+      throw new Error("The file input does not support multiple files; pass exactly one file path.");
+    }
+
+    await send("DOM.setFileInputFiles", { files, objectId });
+    return { acceptsMultiple };
   });
 }
 
@@ -1300,31 +1348,79 @@ async function typeTab(port, token, target, value, options = {}) {
   });
 }
 
+function normalizeUploadFiles(filePaths) {
+  const files = (Array.isArray(filePaths) ? filePaths : [filePaths])
+      .map((file) => String(file == null ? "" : file).trim())
+      .filter(Boolean)
+      .map((file) => path.resolve(file));
+  if (!files.length) throw new Error("At least one absolute file path is required.");
+
+  for (const file of files) {
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      throw new Error(`File not found: ${file}`);
+    }
+    if (!stat.isFile()) throw new Error(`Not a regular file: ${file}`);
+  }
+  return files;
+}
+
 async function uploadTab(port, token, target, filePaths, options = {}) {
+  const raw = String(target || "").trim();
+  if (!raw) throw new Error("Upload target is required.");
+  const files = normalizeUploadFiles(filePaths);
+
+  if (!options.frame) {
+    const tabs = await listDirectPageTargets(port);
+    const tab = resolveTab(tabs, token);
+    let mode = "selector-direct";
+    let expression;
+
+    if (/^e\d+$/i.test(raw)) {
+      mode = "ref-direct";
+      const expected = lookupRefSignature(tab.id, tab.url, raw.toLowerCase());
+      if (!expected?.selector) {
+        throw new Error(`Ref ${raw.toLowerCase()} is not available. Run 'pbc tab snapshot' again and use a fresh ref.`);
+      }
+      expression = `(() => {
+        const expected = ${JSON.stringify({ tag: expected.tag, id: expected.id, name: expected.name, type: expected.type })};
+        const node = document.evaluate(${JSON.stringify(expected.selector)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        if (!node) throw new Error("Upload ref is no longer in the page. Run a fresh snapshot.");
+        const current = { tag: node.tagName.toLowerCase(), id: node.id || "", name: node.getAttribute("name") || "", type: node.getAttribute("type") || "" };
+        if (current.tag !== expected.tag || (expected.id && current.id !== expected.id) || (expected.name && current.name !== expected.name) || (expected.type && current.type !== expected.type)) {
+          throw new Error("Upload ref is stale. Run a fresh snapshot.");
+        }
+        return current.tag === "input" && current.type === "file" ? node : node.querySelector?.('input[type="file"]');
+      })()`;
+    } else {
+      expression = `(() => {
+        const raw = ${JSON.stringify(raw)};
+        let node = null;
+        try { node = document.querySelector(raw); } catch {}
+        if (node && !(node.matches && node.matches('input[type="file"]'))) node = node.querySelector?.('input[type="file"]') || null;
+        if (node) return node;
+        const needle = raw.trim().toLowerCase();
+        for (const input of document.querySelectorAll('input[type="file"]')) {
+          const label = input.id ? document.querySelector('label[for="' + CSS.escape(input.id) + '"]') : null;
+          const haystack = [input.getAttribute("aria-label"), input.getAttribute("name"), label?.textContent, input.closest("label")?.textContent, input.parentElement?.textContent]
+            .filter(Boolean).join(" ").replace(/\s+/g, " ").trim().toLowerCase();
+          if (needle && haystack.includes(needle)) return input;
+        }
+        return null;
+      })()`;
+    }
+
+    await directPageSetFileInputFiles(tab, expression, files);
+    return { uploaded: raw, mode, files, url: tab.url };
+  }
+
   return withResolvedTab(port, token, async (tab) => {
     await ensureUsableViewport(tab.page);
 
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
-
-    const raw = String(target || "").trim();
-    if (!raw) throw new Error("Upload target is required.");
-
-    const files = (Array.isArray(filePaths) ? filePaths : [filePaths])
-      .map((file) => String(file == null ? "" : file).trim())
-      .filter(Boolean)
-      .map((file) => path.resolve(file));
-    if (!files.length) throw new Error("At least one absolute file path is required.");
-
-    for (const file of files) {
-      let stat;
-      try {
-        stat = fs.statSync(file);
-      } catch {
-        throw new Error(`File not found: ${file}`);
-      }
-      if (!stat.isFile()) throw new Error(`Not a regular file: ${file}`);
-    }
 
     const { locator, mode } = await resolveTargetLocator(frame, raw, {
       tabId: tab.id,
