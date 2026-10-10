@@ -1699,26 +1699,27 @@ async function pdfTab(port, token, outputPath, options = {}) {
 }
 
 async function screenshotTab(port, token, outputPath, options = {}) {
-  return withResolvedTab(port, token, async (tab) => {
-    await ensureUsableViewport(tab.page);
-    try {
-      await tab.page.screenshot({ path: outputPath, fullPage: Boolean(options.fullPage), timeout: 10000 });
-    } catch {
-      const session = await tab.page.context().newCDPSession(tab.page);
-      try {
-        const image = await session.send("Page.captureScreenshot", {
-          format: "png",
-          fromSurface: true,
-          captureBeyondViewport: Boolean(options.fullPage),
-        });
-        fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-        fs.writeFileSync(outputPath, Buffer.from(image.data, "base64"));
-      } finally {
-        await session.detach().catch(() => {});
+  const tabs = await listDirectPageTargets(port);
+  const tab = resolveTab(tabs, token);
+  const image = await withDirectPageSession(tab, async (send) => {
+    const params = {
+      format: "png",
+      fromSurface: true,
+      captureBeyondViewport: Boolean(options.fullPage),
+    };
+    if (options.fullPage) {
+      const metrics = await send("Page.getLayoutMetrics");
+      const size = metrics?.cssContentSize || metrics?.contentSize;
+      if (size?.width > 0 && size?.height > 0) {
+        params.clip = { x: 0, y: 0, width: size.width, height: size.height, scale: 1 };
       }
     }
-    return { path: outputPath, url: tab.page.url() };
+    return send("Page.captureScreenshot", params);
   });
+  if (!image?.data) throw new Error("Chrome did not return screenshot data.");
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, Buffer.from(image.data, "base64"));
+  return { path: outputPath, url: tab.url };
 }
 
 async function evalTab(port, token, source, options = {}) {
