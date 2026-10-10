@@ -39,11 +39,11 @@ pbc tab type active e2 "value" --clear
 pbc tab press active Enter
 ```
 
-Main-frame snapshots, ref clicks, and file uploads use lightweight direct page
-CDP. This keeps the live DOM free of PBC attributes and avoids reloads in
-detach-sensitive apps such as YouTube Studio. Explicit `--frame` operations
-retain the Playwright path. Run a new snapshot after navigation or each
-multi-step menu transition.
+Main-frame snapshots, text extraction, ref clicks, and file uploads use
+lightweight direct page CDP. This keeps the live DOM free of PBC attributes and
+avoids reloads in detach-sensitive apps such as YouTube Studio. Explicit
+`--frame` operations retain the Playwright path. Run a new snapshot after
+navigation or each multi-step menu transition.
 
 Use `tab upload` rather than the Windows file picker. Multiple paths require a
 file input that supports multiple files:

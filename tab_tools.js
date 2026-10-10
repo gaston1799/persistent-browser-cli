@@ -944,41 +944,56 @@ async function snapshotTab(port, token, options = {}) {
   });
 }
 
+function collectTextInPage(opts = {}) {
+  const source = document.body?.innerText || document.documentElement?.textContent || "";
+  let output = source.trim().replace(/\n{3,}/g, "\n\n");
+
+  if (opts.includeValues) {
+    const valueLines = [];
+    const seen = new Set();
+    document.querySelectorAll("input, textarea, select").forEach((node) => {
+      const type = String(node.getAttribute("type") || "").toLowerCase();
+      if (type === "password") return;
+      const value = node.value != null ? String(node.value) : "";
+      if (!value) return;
+      const id = node.id ? `#${node.id}` : "";
+      const name = node.getAttribute("name") ? ` name=${JSON.stringify(node.getAttribute("name"))}` : "";
+      const placeholder = node.getAttribute("placeholder") ? ` placeholder=${JSON.stringify(node.getAttribute("placeholder"))}` : "";
+      const line = `[${node.tagName.toLowerCase()}${id}${name}${placeholder}] = ${JSON.stringify(value)}`;
+      if (!seen.has(line)) {
+        seen.add(line);
+        valueLines.push(line);
+      }
+    });
+    if (valueLines.length) {
+      output = `${output}\n\n-- input values --\n${valueLines.join("\n")}`;
+    }
+  }
+
+  return output;
+}
+
 async function textTab(port, token, options = {}) {
+  const includeValues = Boolean(options.includeValues);
+  if (!options.frame) {
+    const tabs = await listDirectPageTargets(port);
+    const tab = resolveTab(tabs, token);
+    const result = await directPageEvaluate(
+      tab,
+      `({text: (${collectTextInPage.toString()})(${JSON.stringify({ includeValues })}), title: document.title, url: location.href})`
+    );
+    return {
+      tab: { id: tab.id, url: result?.url || tab.url, title: result?.title || tab.title },
+      frame: { name: "", url: result?.url || tab.url },
+      text: result?.text || "",
+    };
+  }
+
   return withResolvedTab(port, token, async (tab) => {
     const frame = await resolveFrame(tab.page, options.frame);
     if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
 
-    const includeValues = Boolean(options.includeValues);
-
-    const text = await frame.evaluate((opts) => {
-      const source = document.body?.innerText || document.documentElement?.textContent || "";
-      let output = source.trim().replace(/\n{3,}/g, "\n\n");
-
-      if (opts.includeValues) {
-        const valueLines = [];
-        const seen = new Set();
-        document.querySelectorAll("input, textarea, select").forEach((node) => {
-          const type = String(node.getAttribute("type") || "").toLowerCase();
-          if (type === "password") return;
-          const value = node.value != null ? String(node.value) : "";
-          if (!value) return;
-          const id = node.id ? `#${node.id}` : "";
-          const name = node.getAttribute("name") ? ` name=${JSON.stringify(node.getAttribute("name"))}` : "";
-          const placeholder = node.getAttribute("placeholder") ? ` placeholder=${JSON.stringify(node.getAttribute("placeholder"))}` : "";
-          const line = `[${node.tagName.toLowerCase()}${id}${name}${placeholder}] = ${JSON.stringify(value)}`;
-          if (!seen.has(line)) {
-            seen.add(line);
-            valueLines.push(line);
-          }
-        });
-        if (valueLines.length) {
-          output = `${output}\n\n-- input values --\n${valueLines.join("\n")}`;
-        }
-      }
-
-      return output;
-    }, { includeValues });
+    const text = await frame.evaluate(collectTextInPage, { includeValues });
 
     return {
       tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) },

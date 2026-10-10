@@ -1,6 +1,6 @@
 {
   "name": "pbc",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Control a persistent logged-in Chrome profile with the PBC command-line tool.",
   "author": {
     "name": "Gaston",
