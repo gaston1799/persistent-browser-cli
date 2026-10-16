@@ -36,7 +36,10 @@ $args = @(
 )
 
 if (![string]::IsNullOrWhiteSpace($ChromeFlags)) {
-  $args += $ChromeFlags.Trim().Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+  # Respect double-quoted segments so a single flag value may contain spaces, e.g.
+  # --host-resolver-rules="MAP ads.example.com ~NOTFOUND,MAP cdn.mxpnl.com ~NOTFOUND".
+  # Without this the naive space split chops the value into bogus arguments.
+  $args += [regex]::Matches($ChromeFlags.Trim(), '"[^"]*"|\S+') | ForEach-Object { $_.Value }
 }
 
 Start-Process -FilePath $ChromeExe -ArgumentList $args | Out-Null

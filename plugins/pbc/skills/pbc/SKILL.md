@@ -34,6 +34,8 @@ Snapshot refs are short values such as `e0` and `e1`:
 ```powershell
 pbc tab snapshot active --json
 pbc tab click active e1
+pbc tab rclick active e1
+pbc tab drag active e1 to e2
 pbc tab fill active e2 "value"
 pbc tab type active e2 "value" --clear
 pbc tab press active Enter
@@ -45,8 +47,10 @@ attributes and avoids reloads in detach-sensitive apps such as YouTube Studio.
 Explicit `--frame` operations retain the Playwright path. Run a new snapshot
 after navigation or each multi-step menu transition.
 
-Use `tab upload` rather than the Windows file picker. Multiple paths require a
-file input that supports multiple files:
+Use `tab upload` rather than the Windows file picker. The snapshot ref may be a
+file input or the visible Import/Upload button that opens the chooser; PBC
+intercepts the chooser and assigns the file directly. Multiple paths require a
+chooser that supports multiple files:
 
 ```powershell
 pbc tab upload active e3 "C:\absolute\file.png"

@@ -285,6 +285,8 @@ Drive the already-open persistent Chrome tab directly over CDP:
 pbc tab snapshot active
 pbc tab text active
 pbc tab click active e3
+pbc tab rclick active e3
+pbc tab drag active e3 to e4
 pbc tab fill active e7 "gaston@example.com"
 pbc tab type active e7 "747157"
 pbc tab upload active e3 "C:\Users\Naqua\Desktop\a.png" "C:\Users\Naqua\Desktop\b.png"
@@ -302,9 +304,11 @@ These commands attach to the Chrome instance started by `pbc open`, so they use 
 `pbc tab type` sends real keystrokes one at a time (`--delay-ms N`, default 40ms)
 and is the right tool for Svelte/React controlled inputs where `fill` alone does
 not update framework state; `--clear` empties the field before typing.
-`pbc tab upload` sets file input paths directly via CDP (`DOM.setFileInputFiles`),
-so the OS file picker is never shown. Pass one or more absolute paths; multiple
-files only work when the page's file input supports multiple files.
+`pbc tab upload` sets file paths directly via CDP, so the OS file picker is never
+shown. The ref may point either to an `<input type="file">` or to a visible
+Import/Upload button that opens a file chooser; PBC intercepts that chooser and
+assigns the files in the same command. Pass one or more absolute paths; multiple
+files only work when the page's chooser supports multiple files.
 `pbc tab download` fetches a URL in-page (session cookies apply) or clicks a
 link and captures the download; the output path is optional and defaults to
 `output\pbc-downloads\` with the server-provided filename.

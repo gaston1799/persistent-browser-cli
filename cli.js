@@ -10,6 +10,7 @@ const { spawnSync } = require("node:child_process");
 const {
   CHROME_EXE,
   DATA_ROOT,
+  BLOCK_DOMAINS,
   DEFAULT_CDP_PORT,
   DEFAULT_PWCLI_SESSION,
   USER_DATA_DIR,
@@ -23,6 +24,7 @@ const {
 const {
   activateTab,
   clickTab,
+  dragTab,
   closeTab,
   downloadTab,
   evalTab,
@@ -30,6 +32,9 @@ const {
   gotoTab,
   listCdpTargets,
   healStalledTabs,
+  unstickTab,
+  deflateTab,
+  hoverTab,
   pressKey,
   holdTab,
   testHoldTab,
@@ -92,6 +97,8 @@ Usage:
   pbc tab snapshot <id|match|active> [--frame <name-or-url>] [--json] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab text <id|match|active> [--frame <name-or-url>] [--include-values] [--json] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab rclick <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
+  pbc tab drag <id|match|active> <from-ref> <to-ref> [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab hold <id|match|active> <ref|selector|text> [--hold-ms N] [--until-gone [<selector>]] [--until-visible <selector>] [--until-text <text>] [--timeout-ms N] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab test-hold <id|match|active> <ref|selector|text> [--hold-ms N] [--timeout-ms N] [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
   pbc tab fill <id|match|active> <ref|selector|label> <value> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]
@@ -112,8 +119,13 @@ Usage:
   pbc tab cert <id|match|active> [--json] [--port 9222]
   pbc tab headers <id|match|active> [--json] [--port 9222]
   pbc tab prune [--port 9222] [--keep <id|match>]
+  pbc tab unstick <id|match|active> [--reopen] [--port 9222]
+  pbc tab deflate <id|match|active> [--port 9222]
+  pbc tab hover <id|match|active> <ref|selector|text> [--highlight-ms N] [--no-highlight] [--frame <name-or-url>] [--json] [--port 9222]
 
   pbc net watch <id|match|active> [--install|--log|--clear] [--json] [--port 9222]
+
+  pbc block [ads|off|status|<domain,domain>]  # block ad/tracker/session-replay domains at launch
 
   pbc trace list
   pbc trace latest
@@ -553,6 +565,105 @@ function runPwsh(ps1, args = []) {
   return result.status ?? 1;
 }
 
+// Early warning for the renderer bloat that precedes a CDP wedge: once one renderer
+// passes a few GB its main thread stops answering CDP, and by upstream design that single
+// tab then blocks Playwright's connectOverCDP for the WHOLE browser
+// (playwright issues #42730 / #42882). Better to know before it happens.
+function listOversizedRenderers(profilePath, thresholdGb = 2) {
+  if (process.platform !== "win32" || !profilePath) return [];
+  const fsMod = require("node:fs");
+  const osMod = require("node:os");
+  const pathMod = require("node:path");
+  const tmp = pathMod.join(osMod.tmpdir(), `pbc-doctor-mem-${process.pid}.ps1`);
+  const script = [
+    `$threshold = ${thresholdGb} * 1GB`,
+    `$marker = '${profilePath}'`,
+    `$procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape($marker) -and $_.CommandLine -match '--type=renderer' -and $_.WorkingSetSize -gt $threshold }`,
+    `$procs | ForEach-Object { "$($_.ProcessId) $([math]::Round($_.WorkingSetSize/1MB,0))" }`,
+  ].join("\r\n");
+  try {
+    fsMod.writeFileSync(tmp, script, "utf8");
+    const { execSync } = require("node:child_process");
+    const out = execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tmp}"`, {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15000,
+    });
+    return out
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const [pid, wsMb] = line.split(/\s+/);
+        return { pid, wsMb: Number(wsMb) || 0 };
+      });
+  } catch {
+    return [];
+  } finally {
+    try { fsMod.unlinkSync(tmp); } catch {}
+  }
+}
+
+// Memory-heavy third parties: ad networks, trackers and session-replay recorders. Session
+// replay buffers every DOM mutation for hours, which is a large part of why a long-lived SPA
+// tab can grow to many GB (see the bloat that preceded the CDP wedges). Blocking them at the
+// resolver means the frames and scripts never load at all, which is cheaper than cleaning up.
+const AD_BLOCK_DOMAINS = [
+  "cdn.mxpnl.com",
+  "api-js.mixpanel.com",
+  "mxpnl.com",
+  "mixpanel.com",
+  "fullstory.com",
+  "hotjar.com",
+  "hotjar.io",
+  "mouseflow.com",
+  "smartlook.com",
+  "logrocket.com",
+  "lr-ingest.io",
+  "clarity.ms",
+  "doubleclick.net",
+  "googlesyndication.com",
+  "googleadservices.com",
+  "adservice.google.com",
+  "amazon-adsystem.com",
+  "criteo.com",
+  "criteo.net",
+  "taboola.com",
+  "outbrain.com",
+  "scorecardresearch.com",
+  "quantserve.com",
+  "adsrvr.org",
+  "pubmatic.com",
+  "rubiconproject.com",
+];
+
+function resolveBlockDomains() {
+  const raw = String(BLOCK_DOMAINS || "").trim();
+  if (!raw || /^(0|off|none|false|no)$/i.test(raw)) return [];
+  if (/^(1|on|true|yes|ads|default)$/i.test(raw)) return AD_BLOCK_DOMAINS;
+  return raw
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function buildBlockFlag(domains = resolveBlockDomains()) {
+  if (!domains.length) return "";
+  // Both the apex and a wildcard rule: Chrome's MAP matches the exact host only, so
+  // "MAP doubleclick.net ~NOTFOUND" alone leaves ad.doubleclick.net resolving.
+  const rules = domains
+    .flatMap((domain) => [`MAP ${domain} ~NOTFOUND`, `MAP *.${domain} ~NOTFOUND`])
+    .join(",");
+  // Quoted so the launcher passes the whole rule list as one argument.
+  return `--host-resolver-rules="${rules}"`;
+}
+
+function chromeFlags() {
+  const base = String(process.env.PBC_CHROME_FLAGS || "");
+  if (/host-resolver-rules/i.test(base)) return base;
+  return [base, buildBlockFlag()].filter(Boolean).join(" ");
+}
+
 function currentVersion() {
   if (PBC_VERSION && PBC_VERSION !== "0.0.0") {
     return PBC_VERSION;
@@ -882,7 +993,7 @@ async function main() {
       "-ChromeExe",
       CHROME_EXE,
       "-ChromeFlags",
-      String(process.env.PBC_CHROME_FLAGS || ""),
+      chromeFlags(),
       "-UserDataDir",
       USER_DATA_DIR,
     ]);
@@ -918,7 +1029,7 @@ async function main() {
       process.exit(0);
     }
     if (await isCdpUp(port)) throw new Error(`CDP port ${port} is already in use; choose a different --port.`);
-    const launchStatus = runPwsh("open_persistent_chrome.ps1", ["-Url", url, "-RemoteDebuggingPort", String(port), "-ChromeExe", CHROME_EXE, "-UserDataDir", profileDir, "-ChromeFlags", String(process.env.PBC_CHROME_FLAGS || "")]);
+    const launchStatus = runPwsh("open_persistent_chrome.ps1", ["-Url", url, "-RemoteDebuggingPort", String(port), "-ChromeExe", CHROME_EXE, "-UserDataDir", profileDir, "-ChromeFlags", chromeFlags()]);
     if (launchStatus !== 0) process.exit(launchStatus);
     const openTimeoutMs = Number(process.env.PBC_OPEN_TIMEOUT_MS || 120000);
     const ready = await waitForOpenReady(port, url, openTimeoutMs);
@@ -985,6 +1096,17 @@ async function main() {
     } else {
       lines.push(formatStatus(false, "profile ownership", "could not confirm active use; CDP is down and no profile lock files were found"));
     }
+
+    const fatRenderers = listOversizedRenderers(USER_DATA_DIR, 2);
+    lines.push(
+      fatRenderers.length
+        ? formatStatus(
+            false,
+            "renderer memory",
+            `${fatRenderers.length} renderer(s) over 2 GB (${fatRenderers.map((r) => `pid ${r.pid} ${r.wsMb}MB`).join(", ")}) - these stop answering CDP and then block every Playwright-backed command browser-wide; close those tabs (pbc tab unstick <id>) or run pbc tab heal`
+          )
+        : formatStatus(true, "renderer memory", "no renderer over 2 GB")
+    );
 
     const pbcHits = findCommand("pbc");
     const pbcCliHits = findCommand("pbc-cli");
@@ -1092,6 +1214,45 @@ async function main() {
 
     console.log("Usage: pbc trace list | latest");
     process.exit(1);
+  }
+
+  if (cmd === "block") {
+    const fsMod = require("node:fs");
+    const pathMod = require("node:path");
+    const configPath = pathMod.join(ROOT, "config.local.json");
+    const action = String(argv[1] || "status").trim();
+    if (/^(status|show|list)$/i.test(action)) {
+      const domains = resolveBlockDomains();
+      console.log(`[pbc] BLOCK_DOMAINS = ${BLOCK_DOMAINS || "(unset)"}`);
+      console.log(`[pbc] ${domains.length} domain(s) resolved${domains.length ? `: ${domains.join(", ")}` : ""}`);
+      console.log(`[pbc] launch flag: ${buildBlockFlag(domains) || "(none)"}`);
+      process.exit(0);
+    }
+    let local = {};
+    try { local = JSON.parse(fsMod.readFileSync(configPath, "utf8")); } catch {}
+    if (/^(off|none|0|false|no)$/i.test(action)) {
+      delete local.BLOCK_DOMAINS;
+      fsMod.writeFileSync(configPath, `${JSON.stringify(local, null, 2)}\n`, "utf8");
+      console.log("[pbc] Ad/tracker blocking disabled. Relaunch Chrome (pbc sac, then pbc open) to apply.");
+      process.exit(0);
+    }
+    if (/^(ads|on|1|true|yes|default)$/i.test(action)) {
+      local.BLOCK_DOMAINS = "ads";
+    } else if (action.startsWith("+")) {
+      // Append: keep everything already blocked and add these domains.
+      const additions = action.slice(1).split(/[,\s]+/).map((entry) => entry.trim()).filter(Boolean);
+      const merged = [...new Set([...resolveBlockDomains(), ...additions])];
+      local.BLOCK_DOMAINS = merged.join(",");
+      console.log(`[pbc] added ${additions.length} domain(s): ${additions.join(", ")}`);
+      console.log(`[pbc] block list is now ${merged.length} domain(s)`);
+    } else {
+      local.BLOCK_DOMAINS = action;
+    }
+    fsMod.writeFileSync(configPath, `${JSON.stringify(local, null, 2)}\n`, "utf8");
+    console.log(`[pbc] BLOCK_DOMAINS = ${local.BLOCK_DOMAINS} written to ${configPath}`);
+    console.log(`[pbc] launch flag: ${buildBlockFlag() || "(none)"}`);
+    console.log("[pbc] Relaunch Chrome to apply: pbc sac, then pbc open <url>");
+    process.exit(0);
   }
 
   if (cmd === "net") {
@@ -1365,13 +1526,14 @@ async function main() {
       process.exit(0);
     }
 
-    if (sub === "click") {
+    if (sub === "click" || sub === "rclick") {
+      const rightClick = sub === "rclick";
       const args = positionalArgs(argv.slice(2));
       const token = args[0];
       const target = args.slice(1).join(" ");
       const frame = readArg("--frame", argv);
       if (!token || !target) {
-        console.log("Usage: pbc tab click <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]");
+        console.log(`Usage: pbc tab ${sub} <id|match|active> <ref|selector|text> [--frame <name-or-url>] [--trace] [--trace-dir <path>] [--port 9222]`);
         process.exit(1);
       }
       const result = await runWithTrace({
@@ -1379,10 +1541,10 @@ async function main() {
         port,
         token,
         frame,
-        commandName: "tab-click",
+        commandName: rightClick ? "tab-rclick" : "tab-click",
         argv,
-      }, () => clickTab(port, token, target, { frame }));
-      console.log(`[pbc] Clicked ${result.mode} ${JSON.stringify(result.clicked)}.`);
+      }, () => clickTab(port, token, target, { frame, button: rightClick ? "right" : "left" }));
+      console.log(`[pbc] ${rightClick ? "Right-clicked" : "Clicked"} ${result.mode} ${JSON.stringify(result.clicked)}.`);
       process.exit(0);
     }
 
@@ -1617,6 +1779,91 @@ async function main() {
       if (hasFlag("--json", argv)) printJson(result);
       else if (typeof result.value === "string") console.log(result.value);
       else printJson(result.value);
+      process.exit(0);
+    }
+
+    if (sub === "deflate") {
+      const token = positionalArgs(argv.slice(2))[0];
+      if (!token) {
+        console.log("Usage: pbc tab deflate <id|match|active> [--port 9222]");
+        process.exit(1);
+      }
+      const result = await deflateTab(port, token);
+      console.log(
+        `[pbc] Memory pressure + forced GC sent to [${result.id}] ${result.url || "(no url)"}` +
+          ` | renderer largest WS: ${result.largestRendererMbBefore} MB -> ${result.largestRendererMbAfter} MB (freed ${result.freedMb} MB)`
+      );
+      if (!result.forcedGc && !result.pressureNotification) {
+        console.log("[pbc] The renderer did not accept either request - if it stays bloated, recycle the tab: pbc tab unstick <id> --reopen");
+      }
+      process.exit(0);
+    }
+
+    if (sub === "drag" || sub === "click-drag") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const sourceRef = args[1];
+      const destinationRef = args[2]?.toLowerCase() === "to" ? args[3] : args[2];
+      if (!token || !sourceRef || !destinationRef) {
+        console.log("Usage: pbc tab drag <id|match|active> <from-ref> [to] <to-ref> [--trace] [--trace-dir <path>] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await runWithTrace({
+        enabled: hasFlag("--trace", argv),
+        port,
+        token,
+        commandName: "tab-drag",
+        argv,
+      }, () => dragTab(port, token, sourceRef, destinationRef));
+      console.log(`[pbc] Dragged ${result.source} to ${result.destination} (${result.mode}).`);
+      process.exit(0);
+    }
+
+    if (sub === "hover") {
+      const args = positionalArgs(argv.slice(2));
+      const token = args[0];
+      const target = args.slice(1).join(" ").trim();
+      if (!token || !target) {
+        console.log("Usage: pbc tab hover <id|match|active> <ref|selector|text> [--highlight-ms N] [--no-highlight] [--frame <name-or-url>] [--json] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await hoverTab(port, token, target, {
+        frame: readArg("--frame", argv),
+        highlight: !hasFlag("--no-highlight", argv),
+        highlightMs: Number(readArg("--highlight-ms", argv) || 6000),
+      });
+      if (hasFlag("--json", argv)) printJson(result);
+      else {
+        console.log(`[pbc] Moved cursor onto ${result.mode} target: ${result.element}`);
+        console.log(`[pbc] Nothing was clicked. Screenshot now to verify, then click by ref/selector when sure.`);
+      }
+      process.exit(0);
+    }
+
+    if (sub === "unstick") {
+      const token = positionalArgs(argv.slice(2))[0];
+      if (!token) {
+        console.log("Usage: pbc tab unstick <id|match|active> [--reopen] [--port 9222]");
+        process.exit(1);
+      }
+      const result = await unstickTab(port, token, { reopen: hasFlag("--reopen", argv) });
+      if (!result.matched) {
+        console.log(`[pbc] No page target matched "${token}".`);
+        process.exit(1);
+      }
+      if (!result.closed) {
+        console.log(`[pbc] Could not close ${result.url || result.id} through the browser-level endpoint.`);
+        process.exit(1);
+      }
+      console.log(
+        `[pbc] Closed stuck tab ${result.url || result.id}` +
+          (result.title ? ` (${result.title})` : "") +
+          " via browser-level close (works without the renderer).",
+      );
+      if (result.reopen) {
+        if (result.reopen.ok) console.log(`[pbc] Reopened ${result.reopen.url}`);
+        else console.log(`[pbc] Reopen failed: ${result.reopen.error}`);
+      }
       process.exit(0);
     }
 

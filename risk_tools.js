@@ -1,5 +1,5 @@
 const tls = require("node:tls");
-const { resolveFrame, withResolvedTab } = require("./tab_tools");
+const { evalTab, resolveFrame, withResolvedTab } = require("./tab_tools");
 
 const RISK_PATTERNS = [
   { pattern: /s3\.us-east-2\.amazonaws\.com\/saoletto\/.*\.html/i, reason: "Known JavaScript-stub download path" },
@@ -38,18 +38,22 @@ function classifySignals(url, text, hrefs = []) {
 }
 
 async function classifyTab(port, token) {
-  return withResolvedTab(port, token, async (tab) => {
-    const pageData = await tab.page.evaluate(() => ({
-      text: (document.body?.innerText || document.documentElement?.textContent || "").slice(0, 30000),
-      hrefs: Array.from(document.querySelectorAll("a[href]")).slice(0, 300).map((node) => node.href),
-    }));
-    return { tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) }, ...classifySignals(tab.page.url(), pageData.text, pageData.hrefs) };
-  });
+  const evaluated = await evalTab(port, token, `({
+    text: (document.body?.innerText || document.documentElement?.textContent || "").slice(0, 30000),
+    hrefs: Array.from(document.querySelectorAll("a[href]")).slice(0, 300).map((node) => node.href),
+    url: location.href
+  })`);
+  const pageData = evaluated.value || {};
+  return {
+    tab: evaluated.tab,
+    ...classifySignals(pageData.url || evaluated.tab.url, pageData.text || "", pageData.hrefs || []),
+  };
 }
 
 async function stateTab(port, token, options = {}) {
-  return withResolvedTab(port, token, async (tab) => {
-    const result = await tab.page.evaluate((rawPattern) => {
+  const rawPattern = String(options.keys || "progress|task|unlock|complete|step|verify");
+  const evaluated = await evalTab(port, token, `(() => {
+      const rawPattern = ${JSON.stringify(rawPattern)};
       let matcher;
       try { matcher = new RegExp(rawPattern, "i"); } catch { matcher = /progress|task|unlock|complete|step|verify/i; }
       const summarize = (value) => value == null || ["string", "number", "boolean"].includes(typeof value) ? value : Array.isArray(value) ? { type: "array", length: value.length } : typeof value === "object" ? { type: "object", keys: Object.keys(value).slice(0, 30) } : { type: typeof value };
@@ -63,9 +67,8 @@ async function stateTab(port, token, options = {}) {
         if (components.length >= 60) break;
       }
       return { components, localStorageKeys: Object.keys(localStorage), sessionStorageKeys: Object.keys(sessionStorage), cookieNames: document.cookie.split(";").map((part) => part.trim().split("=")[0]).filter(Boolean) };
-    }, String(options.keys || "progress|task|unlock|complete|step|verify"));
-    return { tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) }, ...result };
-  });
+    })()`);
+  return { tab: evaluated.tab, ...(evaluated.value || {}) };
 }
 
 async function unhideTab(port, token) {
@@ -169,19 +172,23 @@ async function waitUntilTab(port, token, target, options = {}) {
 }
 
 async function certificateTab(port, token) {
-  return withResolvedTab(port, token, async (tab) => {
-    const url = new URL(tab.page.url());
-    if (url.protocol !== "https:") throw new Error("TLS certificate details are only available for HTTPS pages.");
-    const certificate = await new Promise((resolve, reject) => { const socket = tls.connect({ host: url.hostname, port: Number(url.port) || 443, servername: url.hostname, rejectUnauthorized: false }, () => { const cert = socket.getPeerCertificate(true); socket.end(); resolve(cert); }); socket.setTimeout(10000, () => { socket.destroy(); reject(new Error("Timed out while reading the TLS certificate.")); }); socket.on("error", reject); });
-    return { tab: { id: tab.id, url: tab.page.url() }, issuer: certificate.issuer, subject: certificate.subject, subjectaltname: certificate.subjectaltname || "", valid_from: certificate.valid_from, valid_to: certificate.valid_to, fingerprint256: certificate.fingerprint256 || "" };
-  });
+  const evaluated = await evalTab(port, token, "location.href");
+  const url = new URL(evaluated.value || evaluated.tab.url);
+  if (url.protocol !== "https:") throw new Error("TLS certificate details are only available for HTTPS pages.");
+  const certificate = await new Promise((resolve, reject) => { const socket = tls.connect({ host: url.hostname, port: Number(url.port) || 443, servername: url.hostname, rejectUnauthorized: false }, () => { const cert = socket.getPeerCertificate(true); socket.end(); resolve(cert); }); socket.setTimeout(10000, () => { socket.destroy(); reject(new Error("Timed out while reading the TLS certificate.")); }); socket.on("error", reject); });
+  return { tab: evaluated.tab, issuer: certificate.issuer, subject: certificate.subject, subjectaltname: certificate.subjectaltname || "", valid_from: certificate.valid_from, valid_to: certificate.valid_to, fingerprint256: certificate.fingerprint256 || "" };
 }
 
 async function headersTab(port, token) {
-  return withResolvedTab(port, token, async (tab) => {
-    const result = await tab.page.evaluate(async () => { const request = async (method) => { const response = await fetch(location.href, { method, credentials: "same-origin", redirect: "manual" }); return { status: response.status, type: response.type, headers: Object.fromEntries(response.headers.entries()) }; }; try { return await request("HEAD"); } catch { return await request("GET"); } });
-    return { tab: { id: tab.id, url: tab.page.url() }, status: result.status, type: result.type, headers: redactHeaders(result.headers) };
-  });
+  const evaluated = await evalTab(port, token, `(async () => {
+    const request = async (method) => {
+      const response = await fetch(location.href, { method, credentials: "same-origin", redirect: "manual" });
+      return { status: response.status, type: response.type, headers: Object.fromEntries(response.headers.entries()) };
+    };
+    try { return await request("HEAD"); } catch { return await request("GET"); }
+  })()`);
+  const result = evaluated.value || {};
+  return { tab: evaluated.tab, status: result.status, type: result.type, headers: redactHeaders(result.headers) };
 }
 
 module.exports = { classifySignals, classifyTab, stateTab, unhideTab, watchNetwork, grepJsTab, waitUntilTab, certificateTab, headersTab };

@@ -38,7 +38,13 @@ function loadLocalOverrides() {
 
 const local = loadLocalOverrides();
 
+const BLOCK_DOMAINS =
+  process.env.PBC_BLOCK_DOMAINS ||
+  (Array.isArray(local.BLOCK_DOMAINS) ? local.BLOCK_DOMAINS.join(",") : local.BLOCK_DOMAINS) ||
+  "";
+
 module.exports = {
+  BLOCK_DOMAINS,
   CHROME_EXE: process.env.PBC_CHROME_EXE || local.CHROME_EXE || resolveChromeExe(),
   USER_DATA_DIR: process.env.PBC_USER_DATA_DIR || local.USER_DATA_DIR || path.join(DATA_ROOT, "profiles", "default"),
   USER_DATA_DIR_IS_DEFAULT: !process.env.PBC_USER_DATA_DIR && !local.USER_DATA_DIR,

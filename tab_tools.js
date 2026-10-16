@@ -2,6 +2,26 @@
 const os = require("node:os");
 const path = require("node:path");
 const { chromium } = require("playwright-core");
+const { USER_DATA_DIR } = require("./config");
+
+const AGENT_CURSOR_STATE_FILE = path.join(os.tmpdir(), "pbc-agent-cursor-state.json");
+
+function readAgentCursorState(port) {
+  try {
+    const state = JSON.parse(fs.readFileSync(AGENT_CURSOR_STATE_FILE, "utf8"));
+    const value = state?.[String(port)];
+    return Number.isFinite(value?.x) && Number.isFinite(value?.y) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeAgentCursorState(port, x, y) {
+  let state = {};
+  try { state = JSON.parse(fs.readFileSync(AGENT_CURSOR_STATE_FILE, "utf8")); } catch {}
+  state[String(port)] = { x, y, updatedAt: Date.now() };
+  try { fs.writeFileSync(AGENT_CURSOR_STATE_FILE, JSON.stringify(state), "utf8"); } catch {}
+}
 
 function formatTabLabel(tab) {
   const marker = tab.active ? "*" : " ";
@@ -106,11 +126,98 @@ async function connectPages(port, options = {}) {
     } catch (error) {
       lastError = error;
       if (browser) await disconnectBrowser(browser).catch(() => {});
+      // A tab that has stopped answering CDP can never be attached to, so retrying
+      // only burns the same timeout again. Detect that on the first failure and fail
+      // fast with an actionable error instead of three identical waits.
+      if (attempt === 1 && /connectOverCDP|Timeout/i.test(String(error?.message || ""))) {
+        const unresponsive = await findUnresponsiveTabs(port).catch(() => []);
+        if (unresponsive.length) {
+          // Upstream (playwright PR #42883, unmerged) fixes this by bounding the per-page attach
+          // wait to 3s so a frozen tab cannot hold connectOverCDP. We cannot patch playwright-core's
+          // internals, so emulate the intent: a sleeping / Memory-Saver-discarded tab answers again
+          // once it is activated, so revive the offenders and retry before giving up.
+          const fix = String(process.env.PBC_CDP_AUTOFIX || "revive").trim().toLowerCase();
+          if (fix !== "off") {
+            const acted = fix === "close"
+              ? await closeUnresponsiveTargets(port, unresponsive)
+              : await reviveUnresponsiveTargets(port, unresponsive);
+            if (acted.length) {
+              await sleep(1200);
+              lastError = new Error(
+                `${error?.message || error} (auto-${fix} applied to ${acted.length} unresponsive tab(s): ${acted.map((tab) => `[${tab.index}] ${tab.url || tab.title || "(no url)"}`).join(", ")}; retrying)`
+              );
+              continue;
+            }
+          }
+          throw buildUnresponsiveTabsError(unresponsive, error);
+        }
+      }
       if (attempt < maxAttempts) await sleep(250 * attempt);
     }
   }
 
+  // A tab whose renderer has stopped answering CDP blocks connectOverCDP for the
+  // WHOLE browser, so every Playwright-backed command fails while direct-path
+  // commands (eval/text/snapshot/ref clicks) keep working. Name the culprit tab
+  // instead of surfacing a bare connect timeout.
+  const unresponsive = await findUnresponsiveTabs(port, timeout).catch(() => []);
+  if (unresponsive.length) throw buildUnresponsiveTabsError(unresponsive, lastError);
+
   throw lastError;
+}
+
+function buildUnresponsiveTabsError(unresponsive, lastError) {
+  const names = unresponsive
+    .map((tab) => `[${tab.index}] ${tab.url || tab.title || "(no url)"}`)
+    .join(", ");
+  return new Error(
+    `Playwright could not attach to the browser because one or more tabs are not answering CDP: ${names}. ` +
+      "Because connectOverCDP waits on every tab, that blocks all Playwright-backed PBC commands (fill, type, selector/text clicks) even for healthy tabs. " +
+      `Recover with: pbc tab unstick ${unresponsive[0].index}   (browser-level close; your other tabs are unaffected). ` +
+      "Verify first with a direct-path read such as `pbc tab text <index>` - it bypasses Playwright, so it tells you which tab is really dead; a heavy page can stall for 8s+ under load without being wedged. " +
+      "If the tab is only asleep/discarded it can usually be revived by clicking it (PBC tries this automatically unless PBC_CDP_AUTOFIX=off). " +
+      `Original error: ${lastError?.message || lastError}`
+  );
+}
+
+async function findUnresponsiveTabs(port, probeTimeoutMs = 4000) {
+  const targets = (await listCdpTargets(port).catch(() => [])).filter((target) => target.type === "page");
+  const unresponsive = [];
+  for (let index = 0; index < targets.length; index += 1) {
+    // A heavy page can miss a single short probe while it is mid-render, so only
+    // report a tab when it fails twice. A false positive here would tell the
+    // operator to close a healthy tab.
+    let alive = await probeDirectPageLiveness(port, targets[index].id, probeTimeoutMs).catch(() => false);
+    if (!alive) {
+      await sleep(400);
+      alive = await probeDirectPageLiveness(port, targets[index].id, probeTimeoutMs).catch(() => false);
+    }
+    if (!alive) unresponsive.push({ index, id: targets[index].id, url: targets[index].url, title: targets[index].title });
+  }
+  return unresponsive;
+}
+
+// Wake a sleeping / discarded tab so its renderer answers CDP again. Non-destructive:
+// activating a tab is what Chrome itself does when the user clicks it.
+async function reviveUnresponsiveTargets(port, tabs) {
+  const acted = [];
+  for (const tab of tabs) {
+    if (!tab.id) continue;
+    const response = await fetch(`http://127.0.0.1:${port}/json/activate/${tab.id}`).catch(() => null);
+    if (response && response.ok) acted.push({ ...tab, action: "activate" });
+  }
+  return acted;
+}
+
+// Opt-in (PBC_CDP_AUTOFIX=close): close the offending targets instead of reviving them.
+async function closeUnresponsiveTargets(port, tabs) {
+  const acted = [];
+  for (const tab of tabs) {
+    if (!tab.id) continue;
+    const response = await fetch(`http://127.0.0.1:${port}/json/close/${tab.id}`).catch(() => null);
+    if (response && response.ok) acted.push({ ...tab, action: "close" });
+  }
+  return acted;
 }
 
 async function disconnectBrowser(browser) {
@@ -313,25 +420,49 @@ async function reuseOrOpenTab(port, url, options = {}) {
 }
 
 async function listFrames(port, token) {
-  return withResolvedTab(port, token, async (tab) => {
-    return Promise.all(
-      tab.page.frames().map(async (frame, index) => ({
-        index,
-        name: frame.name() || "",
-        url: frame.url(),
-        isMain: frame === tab.page.mainFrame(),
-        element: await frameElementInfo(frame),
-      }))
-    );
+  const tabs = await listDirectPageTargets(port);
+  const tab = resolveTab(tabs, token);
+  return withDirectPageSession(tab, async (send) => {
+    const result = await send("Page.getFrameTree");
+    const frames = [];
+
+    async function visit(node, isMain = false) {
+      const frame = node?.frame || {};
+      let element = null;
+      if (!isMain && frame.id) {
+        try {
+          const owner = await send("DOM.getFrameOwner", { frameId: frame.id });
+          const described = owner?.backendNodeId
+            ? await send("DOM.describeNode", { backendNodeId: owner.backendNodeId })
+            : null;
+          const attrs = described?.node?.attributes || [];
+          const attributes = {};
+          for (let index = 0; index < attrs.length; index += 2) {
+            attributes[attrs[index]] = attrs[index + 1] || "";
+          }
+          element = {
+            id: attributes.id || "",
+            name: attributes.name || "",
+            src: attributes.src || "",
+          };
+        } catch {}
+      }
+      frames.push({
+        index: frames.length,
+        name: frame.name || "",
+        url: frame.url || "",
+        isMain,
+        element,
+      });
+      for (const child of node?.childFrames || []) await visit(child, false);
+    }
+
+    await visit(result?.frameTree, true);
+    return frames;
   });
 }
 
-async function inspectFields(port, token, options = {}) {
-  return withResolvedTab(port, token, async (tab) => {
-    const frame = await resolveFrame(tab.page, options.frame);
-    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
-
-    const controls = await frame.evaluate(() => {
+function collectFieldControlsInPage() {
       const nodes = Array.from(document.querySelectorAll("input, select, textarea, button"));
       return nodes.map((node, index) => {
         const tag = node.tagName.toLowerCase();
@@ -376,7 +507,21 @@ async function inspectFields(port, token, options = {}) {
           text: node.textContent?.trim().replace(/\s+/g, " ").slice(0, 120) || "",
         };
       });
-    });
+}
+
+async function inspectFields(port, token, options = {}) {
+  if (!options.frame) {
+    const tabs = await listDirectPageTargets(port);
+    const tab = resolveTab(tabs, token);
+    const controls = await directPageEvaluate(tab, `(${collectFieldControlsInPage.toString()})()`);
+    return { frame: { name: "", url: tab.url }, controls };
+  }
+
+  return withResolvedTab(port, token, async (tab) => {
+    const frame = await resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+
+    const controls = await frame.evaluate(collectFieldControlsInPage);
 
     return {
       frame: {
@@ -468,7 +613,19 @@ async function resolveFrame(page, frameNeedle) {
 }
 
 function looksLikeSelector(target) {
-  return /^[.#\[]/.test(target) || /^(input|textarea|select|button|a|label|form|div|span)\b/i.test(target) || /^\/\//.test(target);
+  const value = String(target || "").trim();
+  if (!value) return false;
+  // Explicit prefixes win; resolveTargetLocator handles them separately, so "text="
+  // must never fall through to the tag heuristic below.
+  if (/^(text|label|placeholder)=/i.test(value)) return false;
+  if (/^(css|xpath)=/i.test(value)) return true;
+  if (/^\/\//.test(value)) return true;
+  // A phrase containing whitespace is button/link text, not a selector. Without this
+  // guard "Select A Subcategory" matched the tag list via "select\b" and was handed to
+  // locator(), which then sat through Playwright's default timeouts before failing.
+  // For a real descendant selector pass an explicit "css=" prefix.
+  if (/\s/.test(value)) return false;
+  return /^[.#\[]/.test(value) || /^(input|textarea|select|button|a|label|form|div|span)\b/i.test(value);
 }
 
 async function ensureUsableViewport(page) {
@@ -561,7 +718,7 @@ function lookupRefSignature(tabId, frameUrl, ref) {
   }
 }
 
-async function elementState(locator) {
+async function elementState(locator, timeoutMs = actionTimeoutMs()) {
   try {
     return await locator.evaluate((node) => {
       const style = window.getComputedStyle(node);
@@ -582,7 +739,7 @@ async function elementState(locator) {
         visible: style.display !== "none" && style.visibility !== "hidden" && style.visibility !== "collapse" && rect.width > 0 && rect.height > 0,
         disabled: Boolean(node.disabled || node.getAttribute("aria-disabled") === "true"),
       };
-    });
+    }, undefined, { timeout: timeoutMs });
   } catch {
     return null;
   }
@@ -626,6 +783,17 @@ async function locatorExists(locator) {
   return count > 0;
 }
 
+// Prefer a visible text match: the first DOM match is often a hidden option inside a
+// dropdown portal, and waiting on it used to consume Playwright's default timeouts.
+async function pickVisibleTextLocator(frame, text) {
+  const match = frame.getByText(text, { exact: false });
+  try {
+    const visible = match.filter({ visible: true }).first();
+    if (await locatorExists(visible)) return visible;
+  } catch {}
+  return match.first();
+}
+
 async function resolveTargetLocator(frame, raw, options = {}) {
   const { tabId, frameUrl, kind = "input" } = options;
   const trimmed = String(raw || "").trim();
@@ -657,12 +825,21 @@ async function resolveTargetLocator(frame, raw, options = {}) {
     return { locator, mode: "ref" };
   }
 
+  const prefixed = /^(text|label|placeholder)=(.+)$/i.exec(trimmed);
+  if (prefixed) {
+    const needle = prefixed[2].trim();
+    const prefix = prefixed[1].toLowerCase();
+    if (prefix === "text") return { locator: await pickVisibleTextLocator(frame, needle), mode: "text" };
+    if (prefix === "label") return { locator: frame.getByLabel(needle, { exact: false }).first(), mode: "label" };
+    return { locator: frame.getByPlaceholder(needle, { exact: false }).first(), mode: "placeholder" };
+  }
+
   if (looksLikeSelector(trimmed)) {
     return { locator: frame.locator(trimmed).first(), mode: "selector" };
   }
 
   if (kind === "click") {
-    return { locator: frame.getByText(trimmed, { exact: false }).first(), mode: "text" };
+    return { locator: await pickVisibleTextLocator(frame, trimmed), mode: "text" };
   }
 
   const labelLocator = frame.getByLabel(trimmed, { exact: false }).first();
@@ -676,6 +853,7 @@ async function resolveTargetLocator(frame, raw, options = {}) {
 
 async function clickLocatorFastFail(locator, options = {}) {
   const timeout = actionTimeoutMs(options);
+  const button = options.button === "right" ? "right" : "left";
   const state = await elementState(locator);
   if (state) {
     if (state.disabled) {
@@ -686,7 +864,7 @@ async function clickLocatorFastFail(locator, options = {}) {
     }
   }
   try {
-    await locator.click({ timeout });
+    await locator.click({ timeout, button });
   } catch (error) {
     const after = await elementState(locator);
     const detail = after ? describeState(after) : "the target element is not in the DOM";
@@ -722,6 +900,85 @@ async function listDirectPageTargets(port) {
   }));
 }
 
+// Build an actionable error when the page-CDP watchdog fires.
+// A renderer whose main thread is executing long-running JavaScript cannot answer
+// CDP at all, and CDP cannot cancel that JavaScript (Runtime.terminateExecution is
+// served by the very thread that is blocked). Raising PBC_CDP_TIMEOUT_MS therefore
+// does not help; the only reliable recovery is a browser-level target close.
+function describeDirectPageSessionTimeout(sessionStartedAt, pending, alive) {
+  const elapsedMs = Date.now() - sessionStartedAt;
+  const inFlight = [...pending.values()];
+  const waiting = inFlight.length
+    ? inFlight.map((entry) => `${entry.method} (${Date.now() - entry.startedAt}ms)`).join(", ")
+    : "no in-flight command";
+  const head = `Direct page CDP session timed out after ${elapsedMs}ms (watchdog PBC_CDP_TIMEOUT_MS=${cdpTimeoutMs()}). Still waiting on: ${waiting}.`;
+  if (alive) {
+    return [
+      head,
+      "A follow-up probe answered, so the tab is still healthy: the page was busy (e.g. a heavy SPA re-render) rather than wedged.",
+      "Simply retry, or raise PBC_CDP_TIMEOUT_MS for heavy pages. Do not close the tab.",
+    ].join(" ");
+  }
+  return [
+    head,
+    "A follow-up probe also failed, so the page main thread is not answering right now, usually because long-running JavaScript is still executing.",
+    "CDP cannot cancel that JavaScript, so raising PBC_CDP_TIMEOUT_MS will not clear this.",
+    "Retry once first: if the next call answers, the tab was only temporarily busy and must not be closed.",
+    "If it stays unresponsive, recover with: pbc tab unstick active   (browser-level close; add --reopen to reload the URL).",
+  ].join(" ");
+}
+
+// Distinguish "this page is momentarily busy" from "this renderer is blocked" using a
+// fresh, short-lived session. The blocked case cannot be cancelled over CDP, so this
+// distinction decides whether retrying or closing the tab is the correct advice.
+async function probeDirectPageLiveness(port, targetId, timeoutMs = 3000) {
+  if (!targetId) return false;
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:${port}/json/version`);
+  } catch {
+    return false;
+  }
+  if (!response.ok) return false;
+  const version = await response.json().catch(() => null);
+  if (!version || !version.webSocketDebuggerUrl) return false;
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const ws = new WebSocket(version.webSocketDebuggerUrl);
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      try { ws.close(); } catch {}
+      resolve(value);
+    };
+    timer = setTimeout(() => done(false), timeoutMs);
+    ws.addEventListener("open", () => {
+      ws.send(JSON.stringify({ id: 1, method: "Target.attachToTarget", params: { targetId, flatten: true } }));
+    });
+    ws.addEventListener("message", (event) => {
+      let message;
+      try { message = JSON.parse(String(event.data || "{}")); } catch { return; }
+      if (message.id === 1) {
+        const sessionId = message.result?.sessionId || "";
+        if (!sessionId) return done(false);
+        ws.send(
+          JSON.stringify({
+            id: 2,
+            method: "Runtime.evaluate",
+            params: { expression: "1", returnByValue: true },
+            sessionId,
+          })
+        );
+        return;
+      }
+      if (message.id === 2) done(message.result?.result?.value === 1);
+    });
+    ws.addEventListener("error", () => done(false));
+  });
+}
+
 async function withDirectPageSession(target, fn) {
   if (!target.targetId) throw new Error("The selected page has no CDP target id.");
   const response = await fetch(`http://127.0.0.1:${target.port}/json/version`);
@@ -734,7 +991,14 @@ async function withDirectPageSession(target, fn) {
     let sessionId = "";
     let nextId = 1;
     const pending = new Map();
-    const timer = setTimeout(() => finish(new Error("Direct page CDP session timed out.")), cdpTimeoutMs());
+    const eventWaiters = new Set();
+    const sessionStartedAt = Date.now();
+    const timer = setTimeout(() => {
+      void (async () => {
+        const alive = await probeDirectPageLiveness(target.port, target.targetId).catch(() => false);
+        finish(new Error(describeDirectPageSessionTimeout(sessionStartedAt, pending, alive)));
+      })();
+    }, cdpTimeoutMs());
 
     function finish(error, value) {
       if (settled) return;
@@ -742,6 +1006,8 @@ async function withDirectPageSession(target, fn) {
       clearTimeout(timer);
       for (const waiter of pending.values()) waiter.reject(error || new Error("Direct page CDP session closed."));
       pending.clear();
+      for (const waiter of eventWaiters) waiter.reject(error || new Error("Direct page CDP session closed."));
+      eventWaiters.clear();
       try { ws.close(); } catch {}
       if (error) reject(error);
       else resolve(value);
@@ -750,8 +1016,19 @@ async function withDirectPageSession(target, fn) {
     function send(method, params = {}, useSession = true) {
       return new Promise((resolveMessage, rejectMessage) => {
         const id = nextId++;
-        pending.set(id, { resolve: resolveMessage, reject: rejectMessage });
+        pending.set(id, { resolve: resolveMessage, reject: rejectMessage, method, startedAt: Date.now() });
         ws.send(JSON.stringify({ id, method, params, ...(useSession && sessionId ? { sessionId } : {}) }));
+      });
+    }
+
+    function waitForEvent(method, timeoutMs = 1000) {
+      return new Promise((resolveEvent, rejectEvent) => {
+        const waiter = { method, resolve: resolveEvent, reject: rejectEvent, timer: null };
+        waiter.timer = setTimeout(() => {
+          eventWaiters.delete(waiter);
+          rejectEvent(new Error(`Timed out waiting for CDP event ${method}.`));
+        }, timeoutMs);
+        eventWaiters.add(waiter);
       });
     }
 
@@ -760,7 +1037,7 @@ async function withDirectPageSession(target, fn) {
         const attached = await send("Target.attachToTarget", { targetId: target.targetId, flatten: true }, false);
         sessionId = attached?.sessionId || "";
         if (!sessionId) throw new Error("CDP did not return a page session id.");
-        finish(null, await fn((method, params) => send(method, params, true)));
+        finish(null, await fn((method, params) => send(method, params, true), waitForEvent));
       } catch (error) {
         finish(error);
       }
@@ -768,6 +1045,14 @@ async function withDirectPageSession(target, fn) {
     ws.addEventListener("message", (event) => {
       try {
         const message = JSON.parse(String(event.data || "{}"));
+        if (message.method) {
+          for (const waiter of [...eventWaiters]) {
+            if (waiter.method !== message.method) continue;
+            clearTimeout(waiter.timer);
+            eventWaiters.delete(waiter);
+            waiter.resolve(message.params || {});
+          }
+        }
         if (!message.id || !pending.has(message.id)) return;
         const waiter = pending.get(message.id);
         pending.delete(message.id);
@@ -825,6 +1110,348 @@ async function directPageSetFileInputFiles(target, expression, files) {
 
     await send("DOM.setFileInputFiles", { files, objectId });
     return { acceptsMultiple };
+  });
+}
+
+async function directPageUploadThroughChooser(target, expected, files, timeoutMs = 8000) {
+  await fetch(`http://127.0.0.1:${target.port}/json/activate/${target.targetId}`).catch(() => {});
+  const persisted = readAgentCursorState(target.port);
+  return withDirectPageSession(target, async (send, waitForEvent) => {
+    await send("Page.enable");
+    await send("Page.setInterceptFileChooserDialog", { enabled: true });
+    try {
+      const evaluation = await send("Runtime.evaluate", {
+        expression: `document.evaluate(${JSON.stringify(expected.selector)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`,
+        returnByValue: false,
+      });
+      const objectId = evaluation?.result?.objectId;
+      if (!objectId) throw new Error("Upload button is no longer in the page. Run a fresh snapshot.");
+
+      const inspected = await send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function (expected, persisted) {
+          const current = { tag: this.tagName.toLowerCase(), id: this.id || "", name: this.getAttribute("name") || "", type: this.getAttribute("type") || "" };
+          if (current.tag !== expected.tag || (expected.id && current.id !== expected.id) || (expected.name && current.name !== expected.name) || (expected.type && current.type !== expected.type)) return { error: "stale" };
+          if (this.disabled || this.getAttribute("aria-disabled") === "true") return { error: "disabled" };
+          this.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+          const style = getComputedStyle(this);
+          const rect = this.getBoundingClientRect();
+          if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return { error: "hidden" };
+          const previous = window.__pbcAgentCursorPosition;
+          return {
+            x: rect.left + rect.width / 2,
+            y: rect.top + rect.height / 2,
+            startX: previous && Number.isFinite(previous.x) ? previous.x : persisted && Number.isFinite(persisted.x) ? persisted.x : innerWidth * .5,
+            startY: previous && Number.isFinite(previous.y) ? previous.y : persisted && Number.isFinite(persisted.y) ? persisted.y : innerHeight * .45
+          };
+        }`,
+        arguments: [{ value: { tag: expected.tag, id: expected.id, name: expected.name, type: expected.type } }, { value: persisted }],
+        returnByValue: true,
+      });
+      const state = inspected?.result?.value || {};
+      if (state.error) throw new Error(`Upload button is ${state.error}. Run a fresh snapshot and retry.`);
+
+      await send("Runtime.evaluate", { expression: `(${showAgentCursorInPage.toString()})(${state.startX}, ${state.startY})`, returnByValue: true });
+      for (const point of curvedMousePath(state.startX, state.startY, state.x, state.y)) {
+        await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y });
+        await sleep(9 + Math.floor(Math.random() * 8));
+      }
+
+      const chooserOpened = waitForEvent("Page.fileChooserOpened", timeoutMs);
+      await send("Input.dispatchMouseEvent", { type: "mousePressed", x: state.x, y: state.y, button: "left", clickCount: 1 });
+      await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: state.x, y: state.y, button: "left", clickCount: 1 });
+      writeAgentCursorState(target.port, state.x, state.y);
+      const chooser = await chooserOpened;
+      if (!chooser?.backendNodeId) throw new Error("The page opened a file chooser, but CDP did not expose its file input.");
+      if (files.length > 1 && chooser.mode !== "selectMultiple") {
+        throw new Error("The file chooser does not support multiple files; pass exactly one file path.");
+      }
+      await send("DOM.setFileInputFiles", { files, backendNodeId: chooser.backendNodeId });
+      return { mode: chooser.mode || "selectSingle" };
+    } finally {
+      await send("Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
+    }
+  });
+}
+
+function showAgentCursorInPage(x, y) {
+  const cursorId = "__pbc-agent-cursor";
+  let cursor = document.getElementById(cursorId);
+  let created = false;
+  if (!cursor) {
+    created = true;
+    cursor = document.createElement("div");
+    cursor.id = cursorId;
+    cursor.setAttribute("aria-hidden", "true");
+    Object.assign(cursor.style, {
+      position: "fixed",
+      left: "0px",
+      top: "0px",
+      width: "22px",
+      height: "28px",
+      zIndex: "2147483647",
+      pointerEvents: "none",
+      opacity: "1",
+      transform: "translate3d(var(--pbc-x, 0px), var(--pbc-y, 0px), 0)",
+      transition: "transform 180ms cubic-bezier(.2,.8,.2,1), opacity 120ms ease",
+      filter: "drop-shadow(0 2px 3px rgba(0,0,0,.45))",
+    });
+    cursor.innerHTML = `<svg width="22" height="28" viewBox="0 0 22 28" xmlns="http://www.w3.org/2000/svg"><path d="M2 1.5V22l5.7-5.1 4 8.7 4-1.9-4-8.4H20L2 1.5Z" fill="#2f81f7" stroke="white" stroke-width="1.7" stroke-linejoin="round"/></svg>`;
+    cursor.style.setProperty("--pbc-x", `${x}px`);
+    cursor.style.setProperty("--pbc-y", `${y}px`);
+    const style = document.createElement("style");
+    style.id = "__pbc-agent-cursor-style";
+    style.textContent = `
+      @keyframes pbc-agent-click { 0% { box-shadow: 0 0 0 0 rgba(47,129,247,.8); } 100% { box-shadow: 0 0 0 22px rgba(47,129,247,0); } }
+      #__pbc-agent-cursor::before { content: "PBC"; position: absolute; left: 17px; top: 17px; padding: 2px 5px; border-radius: 5px; background: #2f81f7; color: white; font: 700 10px/1.2 system-ui, sans-serif; letter-spacing: .04em; white-space: nowrap; box-shadow: 0 1px 3px rgba(0,0,0,.35); }
+      #__pbc-agent-cursor::after { content: ""; position: absolute; left: -7px; top: -7px; width: 16px; height: 16px; border-radius: 50%; }
+      #__pbc-agent-cursor[data-clicking="true"]::after { animation: pbc-agent-click 420ms ease-out; }
+    `;
+    document.documentElement.append(style, cursor);
+  }
+  const previous = window.__pbcAgentCursorPosition;
+  if (previous && Number.isFinite(previous.x) && Number.isFinite(previous.y)) {
+    cursor.style.setProperty("--pbc-x", `${previous.x}px`);
+    cursor.style.setProperty("--pbc-y", `${previous.y}px`);
+  }
+  cursor.style.opacity = "1";
+  cursor.dataset.clicking = "false";
+  if (!created) {
+    cursor.style.setProperty("--pbc-x", `${x}px`);
+    cursor.style.setProperty("--pbc-y", `${y}px`);
+  }
+  window.__pbcAgentCursorPosition = { x, y };
+  if (!window.__pbcAgentCursorMouseListener) {
+    window.__pbcAgentCursorMouseListener = (event) => {
+      const activeCursor = document.getElementById(cursorId);
+      if (!activeCursor) return;
+      activeCursor.style.setProperty("--pbc-x", `${event.clientX}px`);
+      activeCursor.style.setProperty("--pbc-y", `${event.clientY}px`);
+      activeCursor.style.opacity = "1";
+      window.__pbcAgentCursorPosition = { x: event.clientX, y: event.clientY };
+    };
+    addEventListener("mousemove", window.__pbcAgentCursorMouseListener, true);
+  }
+  if (!window.__pbcAgentCursorVisibilityListener) {
+    window.__pbcAgentCursorVisibilityListener = () => {
+      const activeCursor = document.getElementById(cursorId);
+      if (activeCursor) activeCursor.style.display = document.visibilityState === "visible" ? "block" : "none";
+    };
+    addEventListener("visibilitychange", window.__pbcAgentCursorVisibilityListener, true);
+  }
+  cursor.style.display = document.visibilityState === "visible" ? "block" : "none";
+  return true;
+}
+
+function curvedMousePath(startX, startY, endX, endY) {
+  const dx = endX - startX;
+  const dy = endY - startY;
+  const distance = Math.hypot(dx, dy);
+  const steps = Math.max(14, Math.min(48, Math.ceil(distance / 18)));
+  const side = Math.random() < 0.5 ? -1 : 1;
+  const bend = side * Math.min(130, Math.max(28, distance * (0.16 + Math.random() * 0.16)));
+  const length = distance || 1;
+  const controlX = (startX + endX) / 2 + (-dy / length) * bend;
+  const controlY = (startY + endY) / 2 + (dx / length) * bend;
+  const points = [];
+  for (let index = 1; index <= steps; index += 1) {
+    const t = index / steps;
+    const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    const inverse = 1 - eased;
+    points.push({
+      x: inverse * inverse * startX + 2 * inverse * eased * controlX + eased * eased * endX,
+      y: inverse * inverse * startY + 2 * inverse * eased * controlY + eased * eased * endY,
+    });
+  }
+  return points;
+}
+
+async function moveAgentCursorToLocator(page, locator, port) {
+  await page.bringToFront().catch(() => {});
+  const cursorTimeout = actionTimeoutMs();
+  const scroll = await locator.evaluate((node) => {
+    const rect = node.getBoundingClientRect();
+    const needsScroll = rect.top < 8 || rect.left < 8 || rect.bottom > innerHeight - 8 || rect.right > innerWidth - 8;
+    if (needsScroll) node.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+    return { needsScroll };
+  }, undefined, { timeout: cursorTimeout }).catch(() => ({ needsScroll: false }));
+  if (scroll.needsScroll) await sleep(420);
+  const box = await locator.boundingBox({ timeout: cursorTimeout }).catch(() => null);
+  if (!box) return null;
+  const endX = box.x + box.width / 2;
+  const endY = box.y + box.height / 2;
+  const start = await page.evaluate(({ source, endX, endY }) => {
+    const previous = window.__pbcAgentCursorPosition;
+    const startX = previous && Number.isFinite(previous.x) ? previous.x : Math.max(18, Math.min(innerWidth - 18, innerWidth * .5));
+    const startY = previous && Number.isFinite(previous.y) ? previous.y : Math.max(18, Math.min(innerHeight - 18, innerHeight * .45));
+    const show = new Function(`return (${source})`)();
+    show(startX, startY);
+    return { startX, startY, endX, endY };
+  }, { source: showAgentCursorInPage.toString(), endX, endY });
+  for (const point of curvedMousePath(start.startX, start.startY, endX, endY)) {
+    await page.mouse.move(point.x, point.y);
+    await sleep(9 + Math.floor(Math.random() * 8));
+  }
+  if (Number.isFinite(port)) writeAgentCursorState(port, endX, endY);
+  // Install the cursor re-injection script at most ONCE per page. It used to be added on
+  // every click, which grows the page's init-script list without bound and re-runs all of
+  // them on each navigation (see playwright-mcp #1636 advice on unbounded accumulation in
+  // long-lived CDP sessions). showAgentCursorInPage() re-reads window.__pbcAgentCursorPosition
+  // itself, so a single registration stays correct as the cursor moves.
+  if (!page.__pbcCursorInitScriptAdded) {
+    page.__pbcCursorInitScriptAdded = true;
+    await page.addInitScript({
+      content: `(() => {
+        const install = () => (${showAgentCursorInPage.toString()})(${JSON.stringify(endX)}, ${JSON.stringify(endY)});
+        if (document.documentElement) install(); else addEventListener("DOMContentLoaded", install, { once: true });
+      })()`,
+    }).catch(() => {});
+  }
+  return { x: endX, y: endY };
+}
+
+async function directPageClickRef(target, expected, options = {}) {
+  const button = options.button === "right" ? "right" : "left";
+  await fetch(`http://127.0.0.1:${target.port}/json/activate/${target.targetId}`).catch(() => {});
+  const persisted = readAgentCursorState(target.port);
+  return withDirectPageSession(target, async (send, waitForEvent) => {
+    await send("Page.enable");
+    const evaluation = await send("Runtime.evaluate", {
+      expression: `document.evaluate(${JSON.stringify(expected.selector)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`,
+      returnByValue: false,
+    });
+    const objectId = evaluation?.result?.objectId;
+    if (!objectId) return { error: "missing" };
+
+    const initialResult = await send("Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: `function (expected, persisted) {
+        const current = { tag: this.tagName.toLowerCase(), id: this.id || "", name: this.getAttribute("name") || "", type: this.getAttribute("type") || "" };
+        if (current.tag !== expected.tag || (expected.id && current.id !== expected.id) || (expected.name && current.name !== expected.name) || (expected.type && current.type !== expected.type)) return { error: "stale", current };
+        if (this.disabled || this.getAttribute("aria-disabled") === "true") return { error: "disabled" };
+        const before = this.getBoundingClientRect();
+        const needsScroll = before.top < 8 || before.left < 8 || before.bottom > innerHeight - 8 || before.right > innerWidth - 8;
+        if (needsScroll) this.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
+        const previous = window.__pbcAgentCursorPosition;
+        return {
+          needsScroll,
+          startX: previous && Number.isFinite(previous.x) ? previous.x : persisted && Number.isFinite(persisted.x) ? Math.max(8, Math.min(innerWidth - 8, persisted.x)) : Math.max(18, Math.min(innerWidth - 18, innerWidth * .5)),
+          startY: previous && Number.isFinite(previous.y) ? previous.y : persisted && Number.isFinite(persisted.y) ? Math.max(8, Math.min(innerHeight - 8, persisted.y)) : Math.max(18, Math.min(innerHeight - 18, innerHeight * .45))
+        };
+      }`,
+      arguments: [{ value: { tag: expected.tag, id: expected.id, name: expected.name, type: expected.type } }, { value: persisted }],
+      returnByValue: true,
+    });
+    const initial = initialResult?.result?.value || {};
+    if (initial.error) return initial;
+    if (initial.needsScroll) await sleep(420);
+
+    const stateResult = await send("Runtime.callFunctionOn", {
+      objectId,
+      functionDeclaration: `function () {
+        const style = getComputedStyle(this);
+        const rect = this.getBoundingClientRect();
+        if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return { error: "hidden" };
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      }`,
+      returnByValue: true,
+    });
+    const state = stateResult?.result?.value || {};
+    if (state.error) return state;
+
+    await send("Runtime.evaluate", {
+      expression: `(${showAgentCursorInPage.toString()})(${JSON.stringify(initial.startX)}, ${JSON.stringify(initial.startY)})`,
+      returnByValue: true,
+    });
+    const path = curvedMousePath(initial.startX, initial.startY, state.x, state.y);
+    for (const point of path) {
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y });
+      await sleep(9 + Math.floor(Math.random() * 8));
+    }
+    await send("Runtime.evaluate", {
+      expression: `(() => { const cursor = document.getElementById("__pbc-agent-cursor"); if (cursor) { cursor.dataset.clicking = "false"; void cursor.offsetWidth; cursor.dataset.clicking = "true"; } })()`,
+      returnByValue: true,
+    });
+    const preloadSource = `(() => {
+      const install = () => (${showAgentCursorInPage.toString()})(${JSON.stringify(state.x)}, ${JSON.stringify(state.y)});
+      if (document.documentElement) install(); else addEventListener("DOMContentLoaded", install, { once: true });
+    })()`;
+    await send("Page.addScriptToEvaluateOnNewDocument", { source: preloadSource });
+    const navigationStarted = waitForEvent("Page.frameStartedLoading", 650).catch(() => null);
+    await send("Input.dispatchMouseEvent", { type: "mousePressed", x: state.x, y: state.y, button, clickCount: 1 });
+    await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: state.x, y: state.y, button, clickCount: 1 });
+    writeAgentCursorState(target.port, state.x, state.y);
+    if (await navigationStarted) {
+      await waitForEvent("Page.loadEventFired", 8000).catch(() => null);
+      await sleep(150);
+    }
+    return { clicked: true };
+  });
+}
+
+async function directPageDragRefs(target, sourceExpected, destinationExpected) {
+  await fetch(`http://127.0.0.1:${target.port}/json/activate/${target.targetId}`).catch(() => {});
+  const persisted = readAgentCursorState(target.port);
+  return withDirectPageSession(target, async (send) => {
+    const resolveNode = async (expected) => {
+      const evaluation = await send("Runtime.evaluate", {
+        expression: `document.evaluate(${JSON.stringify(expected.selector)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`,
+        returnByValue: false,
+      });
+      return evaluation?.result?.objectId || "";
+    };
+    const sourceId = await resolveNode(sourceExpected);
+    const destinationId = await resolveNode(destinationExpected);
+    if (!sourceId || !destinationId) return { error: "missing" };
+
+    const inspectNode = async (objectId, expected, scroll) => {
+      const result = await send("Runtime.callFunctionOn", {
+        objectId,
+        functionDeclaration: `function (expected, scroll) {
+          const current = { tag: this.tagName.toLowerCase(), id: this.id || "", name: this.getAttribute("name") || "", type: this.getAttribute("type") || "" };
+          if (current.tag !== expected.tag || (expected.id && current.id !== expected.id) || (expected.name && current.name !== expected.name) || (expected.type && current.type !== expected.type)) return { error: "stale" };
+          if (this.disabled || this.getAttribute("aria-disabled") === "true") return { error: "disabled" };
+          if (scroll) this.scrollIntoView({ block: "center", inline: "center", behavior: "smooth" });
+          const style = getComputedStyle(this);
+          const rect = this.getBoundingClientRect();
+          if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return { error: "hidden" };
+          return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, inViewport: rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth, width: innerWidth, height: innerHeight };
+        }`,
+        arguments: [{ value: { tag: expected.tag, id: expected.id, name: expected.name, type: expected.type } }, { value: scroll }],
+        returnByValue: true,
+      });
+      return result?.result?.value || {};
+    };
+
+    await inspectNode(sourceId, sourceExpected, true);
+    await sleep(420);
+    let source = await inspectNode(sourceId, sourceExpected, false);
+    let destination = await inspectNode(destinationId, destinationExpected, false);
+    if (!destination.inViewport) {
+      await inspectNode(destinationId, destinationExpected, true);
+      await sleep(420);
+      source = await inspectNode(sourceId, sourceExpected, false);
+      destination = await inspectNode(destinationId, destinationExpected, false);
+    }
+    if (source.error || destination.error) return { error: source.error || destination.error };
+    if (!source.inViewport || !destination.inViewport) return { error: "source-and-destination-not-simultaneously-visible" };
+
+    const startX = persisted && Number.isFinite(persisted.x) ? Math.max(8, Math.min(source.width - 8, persisted.x)) : source.width * .5;
+    const startY = persisted && Number.isFinite(persisted.y) ? Math.max(8, Math.min(source.height - 8, persisted.y)) : source.height * .45;
+    await send("Runtime.evaluate", { expression: `(${showAgentCursorInPage.toString()})(${startX}, ${startY})`, returnByValue: true });
+    for (const point of curvedMousePath(startX, startY, source.x, source.y)) {
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y });
+      await sleep(9 + Math.floor(Math.random() * 8));
+    }
+    await send("Input.dispatchMouseEvent", { type: "mousePressed", x: source.x, y: source.y, button: "left", clickCount: 1 });
+    await sleep(90 + Math.floor(Math.random() * 80));
+    for (const point of curvedMousePath(source.x, source.y, destination.x, destination.y)) {
+      await send("Input.dispatchMouseEvent", { type: "mouseMoved", x: point.x, y: point.y, button: "left", buttons: 1 });
+      await sleep(11 + Math.floor(Math.random() * 9));
+    }
+    await send("Input.dispatchMouseEvent", { type: "mouseReleased", x: destination.x, y: destination.y, button: "left", clickCount: 1 });
+    writeAgentCursorState(target.port, destination.x, destination.y);
+    return { dragged: true };
   });
 }
 
@@ -1006,6 +1633,7 @@ async function textTab(port, token, options = {}) {
 async function clickTab(port, token, target, options = {}) {
   const raw = String(target || "").trim();
   if (!raw) throw new Error("Click target is required.");
+  const button = options.button === "right" ? "right" : "left";
 
   if (!options.frame && /^e\d+$/i.test(raw)) {
     const tabs = await listDirectPageTargets(port);
@@ -1014,25 +1642,11 @@ async function clickTab(port, token, target, options = {}) {
     if (!expected?.selector) {
       throw new Error(`Ref ${raw.toLowerCase()} is not available. Run 'pbc tab snapshot' again and use a fresh ref.`);
     }
-    const result = await directPageEvaluate(tab, `(() => {
-      const expected = ${JSON.stringify({ tag: expected.tag, id: expected.id, name: expected.name, type: expected.type })};
-      const node = document.evaluate(${JSON.stringify(expected.selector)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
-      if (!node) return { error: "missing" };
-      const current = { tag: node.tagName.toLowerCase(), id: node.id || "", name: node.getAttribute("name") || "", type: node.getAttribute("type") || "" };
-      if (current.tag !== expected.tag || (expected.id && current.id !== expected.id) || (expected.name && current.name !== expected.name) || (expected.type && current.type !== expected.type)) {
-        return { error: "stale", current };
-      }
-      const style = getComputedStyle(node);
-      const rect = node.getBoundingClientRect();
-      if (node.disabled || node.getAttribute("aria-disabled") === "true") return { error: "disabled" };
-      if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return { error: "hidden" };
-      node.click();
-      return { clicked: true, url: location.href };
-    })()`);
+    const result = await directPageClickRef(tab, expected, { button });
     if (result?.error) {
       throw new Error(`Cannot click ref ${raw.toLowerCase()}: ${result.error}. Run 'pbc tab snapshot' again and use a fresh ref.`);
     }
-    return { clicked: raw, mode: "ref-direct", url: result?.url || tab.url };
+    return { clicked: raw, mode: "ref-direct", url: tab.url };
   }
 
   return withResolvedTab(port, token, async (tab) => {
@@ -1046,10 +1660,31 @@ async function clickTab(port, token, target, options = {}) {
       frameUrl: frame.url(),
       kind: "click",
     });
-    await clickLocatorFastFail(locator, { timeoutMs: options.timeoutMs });
+    await moveAgentCursorToLocator(tab.page, locator, port);
+    await clickLocatorFastFail(locator, { timeoutMs: options.timeoutMs, button });
 
-    return { clicked: raw, mode, url: tab.page.url() };
+    return { clicked: raw, mode, button, url: tab.page.url() };
   });
+}
+
+async function dragTab(port, token, sourceRef, destinationRef) {
+  const source = String(sourceRef || "").trim().toLowerCase();
+  const destination = String(destinationRef || "").trim().toLowerCase();
+  if (!/^e\d+$/.test(source) || !/^e\d+$/.test(destination)) {
+    throw new Error("Drag currently requires two fresh snapshot refs, for example: pbc tab drag active e12 e19");
+  }
+  const tabs = await listDirectPageTargets(port);
+  const tab = resolveTab(tabs, token);
+  const sourceExpected = lookupRefSignature(tab.id, tab.url, source);
+  const destinationExpected = lookupRefSignature(tab.id, tab.url, destination);
+  if (!sourceExpected?.selector || !destinationExpected?.selector) {
+    throw new Error("One or both drag refs are unavailable. Run 'pbc tab snapshot' again and use fresh refs.");
+  }
+  const result = await directPageDragRefs(tab, sourceExpected, destinationExpected);
+  if (result?.error) {
+    throw new Error(`Cannot drag ${source} to ${destination}: ${result.error}. Run 'pbc tab snapshot' again and use fresh refs.`);
+  }
+  return { source, destination, mode: "ref-direct", url: tab.url };
 }
 
 async function holdTab(port, token, target, options = {}) {
@@ -1320,6 +1955,7 @@ async function fillTab(port, token, target, value, options = {}) {
       frameUrl: frame.url(),
       kind: "input",
     });
+    await moveAgentCursorToLocator(tab.page, locator, port);
     const method = await fillLocatorFastFail(locator, String(value), { timeoutMs: options.timeoutMs });
 
     return { filled: raw, mode, method, url: tab.page.url() };
@@ -1344,6 +1980,7 @@ async function typeTab(port, token, target, value, options = {}) {
       frameUrl: frame.url(),
       kind: "input",
     });
+    await moveAgentCursorToLocator(tab.page, locator, port);
 
     if (options.clear) {
       await locator.focus({ timeout });
@@ -1398,6 +2035,10 @@ async function uploadTab(port, token, target, filePaths, options = {}) {
       const expected = lookupRefSignature(tab.id, tab.url, raw.toLowerCase());
       if (!expected?.selector) {
         throw new Error(`Ref ${raw.toLowerCase()} is not available. Run 'pbc tab snapshot' again and use a fresh ref.`);
+      }
+      if (expected.tag !== "input" || String(expected.type || "").toLowerCase() !== "file") {
+        await directPageUploadThroughChooser(tab, expected, files, actionTimeoutMs(options));
+        return { uploaded: raw, mode: "ref-file-chooser-direct", files, url: tab.url };
       }
       expression = `(() => {
         const expected = ${JSON.stringify({ tag: expected.tag, id: expected.id, name: expected.name, type: expected.type })};
@@ -1896,6 +2537,212 @@ async function saveAndCloseBrowser(port) {
   return { closedTabs, browserClose };
 }
 
+// Create a tab through the browser-level CDP endpoint. Like /json/close this is
+// served by the browser process, so it still works when a renderer is wedged.
+async function createCdpTarget(port, url) {
+  const response = await fetch(`http://127.0.0.1:${port}/json/version`);
+  if (!response.ok) throw new Error(`Could not read CDP version endpoint on port ${port}.`);
+  const data = await response.json();
+  if (!data.webSocketDebuggerUrl) throw new Error(`CDP websocket URL is missing on port ${port}.`);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const ws = new WebSocket(data.webSocketDebuggerUrl);
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch {}
+      reject(new Error("Timed out while requesting Target.createTarget."));
+    }, cdpTimeoutMs());
+    ws.addEventListener("open", () => {
+      ws.send(JSON.stringify({ id: 1, method: "Target.createTarget", params: { url } }));
+    });
+    ws.addEventListener("message", (event) => {
+      if (settled) return;
+      let message;
+      try { message = JSON.parse(String(event.data || "{}")); } catch { return; }
+      if (message.id !== 1) return;
+      settled = true;
+      clearTimeout(timer);
+      try { ws.close(); } catch {}
+      if (message.error) reject(new Error(message.error.message || "Target.createTarget failed."));
+      else resolve(message.result || {});
+    });
+    ws.addEventListener("error", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error("CDP connection failed while creating the target."));
+    });
+  });
+}
+
+// Close a tab that has stopped answering page-level CDP using the browser-level
+// HTTP endpoint. This works even when the renderer main thread is blocked, which is
+// the one recovery path that does not require killing Chrome.
+async function unstickTab(port, token, options = {}) {
+  const raw = String(token == null ? "active" : token).trim() || "active";
+  const response = await fetch(`http://127.0.0.1:${port}/json/list`).catch(() => null);
+  if (!response || !response.ok) throw new Error(`CDP /json/list not reachable on port ${port}.`);
+  const pages = (await response.json().catch(() => [])).filter((target) => target.type === "page");
+  if (!pages.length) return { matched: false, closed: false, reasons: "no page targets" };
+
+  let target = null;
+  if (/^active$/i.test(raw)) {
+    target = pages[0];
+  } else if (/^\d+$/.test(raw)) {
+    target = pages[Number(raw)] || null;
+  } else {
+    const needle = raw.toLowerCase();
+    target =
+      pages.find((page) => `${page.url || ""} ${page.title || ""}`.toLowerCase().includes(needle)) || null;
+  }
+  if (!target) return { matched: false, closed: false, token: raw };
+
+  const url = target.url || "";
+  const title = target.title || "";
+  const closeResponse = await fetch(`http://127.0.0.1:${port}/json/close/${target.id}`).catch(() => null);
+  const closed = Boolean(closeResponse && closeResponse.ok);
+
+  let reopen = null;
+  if (closed && options.reopen && url) {
+    try {
+      const created = await createCdpTarget(port, url);
+      const targetId = created?.targetId || "";
+      let verified = false;
+      for (let attempt = 0; attempt < 6 && !verified; attempt += 1) {
+        await sleep(500);
+        const check = await fetch(`http://127.0.0.1:${port}/json/list`).catch(() => null);
+        if (!check || !check.ok) break;
+        const list = await check.json().catch(() => []);
+        verified = list.some((target) => target.type === "page" && target.id === targetId);
+      }
+      reopen = { ok: Boolean(targetId) && verified, url, targetId };
+      if (!reopen.ok) {
+        reopen.error = `Target.createTarget returned ${targetId || "no target id"} but no matching tab was listed afterwards.`;
+      }
+    } catch (error) {
+      reopen = { ok: false, error: error.message || String(error) };
+    }
+  }
+  return { matched: true, closed, id: target.id, url, title, reopen };
+}
+
+// Largest resident (WorkingSet) size among this profile's renderers, in MB. WorkingSet is
+// resident memory, which matters: the retracted playwright-mcp #1636 report was virtual-only.
+function largestRendererWorkingSetMb() {
+  if (process.platform !== "win32") return 0;
+  const fsMod = require("node:fs");
+  const osMod = require("node:os");
+  const pathMod = require("node:path");
+  const tmp = pathMod.join(osMod.tmpdir(), `pbc-mem-${process.pid}.ps1`);
+  const script = [
+    `$marker = '${USER_DATA_DIR}'`,
+    `$procs = Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -match [regex]::Escape($marker) -and $_.CommandLine -match '--type=renderer' }`,
+    `($procs | Measure-Object -Property WorkingSetSize -Maximum).Maximum`,
+  ].join("\r\n");
+  try {
+    fsMod.writeFileSync(tmp, script, "utf8");
+    const { execSync } = require("node:child_process");
+    const out = execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tmp}"`, {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15000,
+    });
+    const bytes = Number(String(out).trim());
+    return Number.isFinite(bytes) && bytes > 0 ? Math.round(bytes / 1048576) : 0;
+  } catch {
+    return 0;
+  } finally {
+    try { fsMod.unlinkSync(tmp); } catch {}
+  }
+}
+
+// Non-destructive mitigation for the renderer bloat that precedes a CDP wedge. Chrome gives
+// no way to cancel runaway JS, but Memory.simulatePressureNotification makes the renderer
+// collect garbage and drop caches, and HeapProfiler.collectGarbage forces a full GC. This is
+// the "apply pressure / recycle instead of killing the tab" half of the advice in
+// microsoft/playwright #15400 and playwright-mcp #1636 - it costs no page state.
+async function deflateTab(port, token) {
+  const tabs = await listDirectPageTargets(port);
+  const tab = resolveTab(tabs, token);
+  if (!tab) throw new Error(`No page target matched "${token}".`);
+  const beforeMb = largestRendererWorkingSetMb();
+  const outcome = await withDirectPageSession(tab, async (send) => {
+    const pressure = await send("Memory.simulatePressureNotification", { level: "critical" })
+      .then(() => true)
+      .catch(() => false);
+    const gc = await send("HeapProfiler.collectGarbage")
+      .then(() => true)
+      .catch(() => false);
+    return { pressure, gc };
+  });
+  await sleep(1500);
+  const afterMb = largestRendererWorkingSetMb();
+  return {
+    id: tab.id,
+    url: tab.url,
+    title: tab.title,
+    pressureNotification: outcome.pressure,
+    forcedGc: outcome.gc,
+    largestRendererMbBefore: beforeMb,
+    largestRendererMbAfter: afterMb,
+    freedMb: Math.max(0, beforeMb - afterMb),
+  };
+}
+
+// Move the human-like cursor onto a target WITHOUT clicking anything, and optionally
+// outline it so a screenshot can prove which element was selected before a real click.
+// Use this to verify a risky target (Save, Submit, Delete) first.
+async function hoverTab(port, token, target, options = {}) {
+  const raw = String(target || "").trim();
+  if (!raw) throw new Error("Hover target is required.");
+  return withResolvedTab(port, token, async (tab) => {
+    const frame = await resolveFrame(tab.page, options.frame);
+    if (!frame) throw new Error(`Could not find a frame matching "${options.frame}".`);
+    // Resolve exactly like a click would, so what you verify is what would be clicked.
+    const { locator, mode } = await resolveTargetLocator(frame, raw, {
+      tabId: tab.id,
+      frameUrl: frame.url(),
+      kind: "click",
+    });
+    const state = await elementState(locator);
+    if (!state) {
+      throw new Error(
+        `Hover target ${JSON.stringify(raw)} was not found (mode=${mode}). Nothing was moved or clicked.`
+      );
+    }
+    const cursor = await moveAgentCursorToLocator(tab.page, locator, port);
+    let outlined = false;
+    if (options.highlight !== false) {
+      const ms = Number(options.highlightMs) > 0 ? Number(options.highlightMs) : 6000;
+      outlined = await locator
+        .evaluate((node, highlightMs) => {
+          const previousOutline = node.style && node.style.outline;
+          const previousOffset = node.style && node.style.outlineOffset;
+          node.style.outline = "3px solid #2f81f7";
+          node.style.outlineOffset = "2px";
+          setTimeout(() => {
+            if (!node.style) return;
+            node.style.outline = previousOutline || "";
+            node.style.outlineOffset = previousOffset || "";
+          }, highlightMs);
+          return true;
+        }, ms)
+        .catch(() => false);
+    }
+    return {
+      tab: { id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => tab.title) },
+      frame: { name: frame.name() || "", url: frame.url() },
+      target: raw,
+      mode,
+      element: describeState(state),
+      outlined,
+      cursor: cursor ? { x: Math.round(cursor.x), y: Math.round(cursor.y) } : null,
+      clicked: false,
+    };
+  });
+}
+
 async function pressKey(port, token, key, options = {}) {
   return withResolvedTab(port, token, async (tab) => {
     await ensureUsableViewport(tab.page);
@@ -1921,7 +2768,7 @@ async function listCdpTargets(port) {
   }));
 }
 
-function killOversizedRenderers(thresholdGb = 2, profileMarker = "codex-tools\\pbc") {
+function killOversizedRenderers(thresholdGb = 2, profileMarker = USER_DATA_DIR) {
   const script = [
     `$threshold = ${thresholdGb} * 1GB`,
     `$marker = '${profileMarker}'`,
@@ -1984,13 +2831,16 @@ async function healStalledTabs(port, options = {}) {
 module.exports = {
   activateTab,
   clickTab,
+  dragTab,
   closeTab,
+  deflateTab,
   evalTab,
   fillTab,
   listCdpTargets,
   healStalledTabs,
   pressKey,
   gotoTab,
+  hoverTab,
   holdTab,
   testHoldTab,
   inspectFields,
@@ -2003,6 +2853,7 @@ module.exports = {
   snapshotTab,
   textTab,
   typeTab,
+  unstickTab,
   uploadTab,
   downloadTab,
   pdfTab,
