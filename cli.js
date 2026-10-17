@@ -229,6 +229,19 @@ function findCommand(command) {
     .filter(Boolean);
 }
 
+function commandDirectories(hits) {
+  const seen = new Set();
+  const directories = [];
+  for (const hit of hits) {
+    const directory = path.dirname(hit);
+    const key = directory.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    directories.push(directory);
+  }
+  return directories;
+}
+
 function getProfileLockFiles(userDataDir) {
   const names = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
   return names.filter((name) => fs.existsSync(path.join(userDataDir, name)));
@@ -1114,6 +1127,18 @@ async function main() {
     lines.push(formatStatus(pbcHits.length > 0, "command shim pbc", pbcHits[0] || "not found in PATH"));
     lines.push(formatStatus(pbcCliHits.length > 0, "command shim pbc-cli", pbcCliHits[0] || "not found in PATH"));
     lines.push(formatStatus(fullHits.length > 0, "command shim persistent-browser-cli", fullHits[0] || "not found in PATH"));
+    const pbcDirectories = commandDirectories(pbcHits);
+    if (pbcDirectories.length > 1) {
+      lines.push(
+        formatStatus(
+          false,
+          "command shim precedence",
+          `multiple PBC installations are on PATH; the first directory wins: ${pbcDirectories.join(" -> ")}. Re-run setup.exe --link-global or install.ps1 -LinkGlobal to remove stale managed shims and put the active npm prefix first`
+        )
+      );
+    } else if (pbcDirectories.length === 1) {
+      lines.push(formatStatus(true, "command shim precedence", `single PBC shim directory: ${pbcDirectories[0]}`));
+    }
     lines.push(formatInfo("powershell alias note", "`cli` collides with Clear-Item, so use `pbc` or `pbc-cli`"));
 
     console.log("persistent-browser-cli doctor");

@@ -75,6 +75,10 @@ an account. Do not change the active account unless the user asked for it.
 
 - Command drift: inspect `pbc --help`; if an update is authorized, run
   `pbc update`, then recheck help and `pbc doctor`.
+- Wrong version after reinstall: run `Get-Command pbc -All` and `pbc doctor`.
+  If multiple shim directories appear, rerun `setup.exe --link-global` or
+  `install.ps1 -LinkGlobal` to remove stale managed PBC shims and put the active
+  npm prefix first in the user `PATH`.
 - CDP down: use `pbc open <url>`.
 - Stale refs: take a fresh snapshot and retry once.
 - Missing iframe control: run `pbc tab frames active`, then use `--frame`.

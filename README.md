@@ -240,7 +240,7 @@ Run a quick environment check:
 pbc doctor
 ```
 
-This verifies the effective Chrome path, profile path, backup path, command shims, and whether the configured CDP endpoint is reachable.
+This verifies the effective Chrome path, profile path, backup path, command shims, and whether the configured CDP endpoint is reachable. It also reports when multiple PBC shim directories are present on `PATH`, because Windows silently runs the first (possibly stale) installation. Re-running `setup.exe --link-global` or `install.ps1 -LinkGlobal` removes stale PBC-only shims from an inactive bundled Node directory and moves the active npm prefix to the front of the user `PATH`.
 
 Check for updates:
 
