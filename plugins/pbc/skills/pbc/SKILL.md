@@ -61,6 +61,14 @@ pbc tab screenshot active "C:\absolute\shot.png"
 For structured reads, prefer `tab text --json`; use `snapshot` when refs or
 control metadata are needed. Use `--trace` to collect a reproducible failure.
 
+## Cinematic mode (beta)
+
+Use `pbc cinematic doctor`, `pbc cinematic example <path>`, `pbc cinematic run
+<script.json>`, and `pbc cinematic stitch <video> <audio>`. A cinematic script
+actively controls its selected tab, so inspect the JSON first and test against a
+disposable tab. Add sensitive selectors to its top-level `redact` list. Treat
+the command surface and manifest schema as unstable while it is beta.
+
 ## Safety and login boundaries
 
 Reuse the saved profile. Use the requested sign-in provider, usually Google,

@@ -387,6 +387,32 @@ pbc tab screenshot active --full-page
 pbc tab eval active "Array.from(document.links).map(a => a.href)" --json
 ```
 
+## Cinematic browser demos (beta)
+
+The beta cinematic mode records a scripted walkthrough from the logged-in
+persistent Chrome profile, captures marked screenshots, exports narration cues,
+and encodes an MP4 when FFmpeg is available.
+
+```powershell
+pbc cinematic doctor
+pbc cinematic example .\cinematic.example.json
+pbc cinematic run .\cinematic.example.json --tab active
+```
+
+Each run writes frames, `manifest.json`, narration files, marked screenshots,
+and (when FFmpeg is installed) an MP4 under `output\cinematic\<name>`. To attach
+an existing WAV or MP3 narration track:
+
+```powershell
+pbc cinematic stitch .\output\cinematic\product-demo\product-demo.mp4 .\voiceover.wav
+```
+
+Supported scene actions are `goto`, `click`, `fill`, `press`, `scroll`, and
+`pause`. A cinematic script actively controls the selected tab and may navigate
+or submit UI actions. Review scripts before running them, use a disposable tab
+for experiments, and add sensitive selectors to the top-level `redact` list.
+This interface and output schema may change while the feature is beta.
+
 ## Download-Safety And Risk Inspection
 
 For unfamiliar sites, use the native diagnostic commands before interacting with download buttons. They inspect the current browser session and redact cookies and authorization headers.

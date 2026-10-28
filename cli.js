@@ -61,6 +61,12 @@ const {
   waitUntilTab,
   watchNetwork,
 } = require("./risk_tools");
+const {
+  ffmpegAvailable,
+  runCinematic,
+  stitchVoiceover,
+  writeExample,
+} = require("./cinematic_tools");
 
 const ROOT = __dirname;
 const SELF_REPO = process.env.PBC_GITHUB_REPO || "gaston1799/persistent-browser-cli";
@@ -130,6 +136,11 @@ Usage:
   pbc trace list
   pbc trace latest
 
+  pbc cinematic doctor [--json]  # BETA
+  pbc cinematic example [path]
+  pbc cinematic run <script.json> [--tab active|<url-or-title>] [--output <video.mp4>] [--output-dir <dir>] [--port 9222] [--json]
+  pbc cinematic stitch <video.mp4> <voiceover.wav|mp3> [--output <video-with-voiceover.mp4>] [--json]
+
   pbc pw <playwright-cli args...>
 
 Environment overrides:
@@ -189,7 +200,7 @@ function positionalArgs(argv) {
   const result = [];
   for (let i = 0; i < argv.length; i += 1) {
     const value = argv[i];
-    if (value === "--port" || value === "--frame" || value === "--keep" || value === "--match" || value === "--tab" || value === "--trace-dir" || value === "--file" || value === "--base64" || value === "--keys-file" || value === "--keys-base64" || value === "--pattern-file" || value === "--pattern-base64" || value === "--timeout" || value === "--delay-ms" || value === "--hold-ms" || value === "--until-gone" || value === "--until-visible" || value === "--until-text" || value === "--timeout-ms" || value === "--regex" || value === "--scale" || value === "--paper-width" || value === "--paper-height" || value === "--pages") {
+    if (value === "--port" || value === "--frame" || value === "--keep" || value === "--match" || value === "--tab" || value === "--trace-dir" || value === "--file" || value === "--base64" || value === "--keys-file" || value === "--keys-base64" || value === "--pattern-file" || value === "--pattern-base64" || value === "--timeout" || value === "--delay-ms" || value === "--hold-ms" || value === "--until-gone" || value === "--until-visible" || value === "--until-text" || value === "--timeout-ms" || value === "--regex" || value === "--scale" || value === "--paper-width" || value === "--paper-height" || value === "--pages" || value === "--output" || value === "--output-dir") {
       i += 1;
       continue;
     }
@@ -1239,6 +1250,55 @@ async function main() {
 
     console.log("Usage: pbc trace list | latest");
     process.exit(1);
+  }
+
+  if (cmd === "cinematic") {
+    const sub = argv[1];
+    if (sub === "doctor") {
+      const result = { beta: true, ffmpeg: ffmpegAvailable(), cdpPort: Number(readArg("--port", argv) || DEFAULT_CDP_PORT) };
+      if (hasFlag("--json", argv)) printJson(result);
+      else console.log(`[pbc][BETA] Cinematic: FFmpeg ${result.ffmpeg ? "ready" : "not found"}; CDP port ${result.cdpPort}.`);
+      process.exit(result.ffmpeg ? 0 : 1);
+    }
+    if (sub === "example") {
+      const target = positionalArgs(argv.slice(2))[0] || "cinematic.example.json";
+      const output = writeExample(target);
+      console.log(`[pbc][BETA] Cinematic example saved: ${output}`);
+      process.exit(0);
+    }
+    if (sub === "run") {
+      const scriptPath = positionalArgs(argv.slice(2))[0];
+      if (!scriptPath) throw new Error("Usage: pbc cinematic run <script.json> [--tab active|<url-or-title>] [--output <video.mp4>] [--output-dir <dir>] [--port 9222] [--json]");
+      const port = Number(readArg("--port", argv) || DEFAULT_CDP_PORT);
+      if (!(await isCdpUp(port))) {
+        console.log(`CDP: DOWN (http://127.0.0.1:${port})`);
+        process.exit(2);
+      }
+      if (!hasFlag("--json", argv)) console.log("[pbc][BETA] Cinematic capture may change the selected tab by executing the script's actions.");
+      const result = await runCinematic({
+        scriptPath,
+        port,
+        tab: readArg("--tab", argv),
+        outputPath: readArg("--output", argv),
+        outputDir: readArg("--output-dir", argv),
+      });
+      if (hasFlag("--json", argv)) printJson(result);
+      else {
+        console.log(`[pbc][BETA] Cinematic capture complete: ${result.outputPath || "frames + manifest (FFmpeg unavailable)"}`);
+        console.log(`[pbc] Manifest: ${result.manifestPath}`);
+        console.log(`[pbc] Narration: ${result.narrationPath}`);
+      }
+      process.exit(0);
+    }
+    if (sub === "stitch") {
+      const args = positionalArgs(argv.slice(2));
+      if (!args[0] || !args[1]) throw new Error("Usage: pbc cinematic stitch <video.mp4> <voiceover.wav|mp3> [--output <video-with-voiceover.mp4>] [--json]");
+      const result = stitchVoiceover(args[0], args[1], readArg("--output", argv));
+      if (hasFlag("--json", argv)) printJson({ beta: true, ...result });
+      else console.log(`[pbc][BETA] Voiceover video saved: ${result.outputPath}`);
+      process.exit(0);
+    }
+    throw new Error("Usage: pbc cinematic example|run|stitch|doctor (beta)");
   }
 
   if (cmd === "block") {
