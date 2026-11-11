@@ -824,6 +824,8 @@ function renderSnapshot(info) {
       item.type ? `type=${item.type}` : null,
       item.role ? `role=${item.role}` : null,
       item.disabled ? "disabled" : null,
+      item.clickability === "intercepted" ? `intercepted-by=${JSON.stringify(item.interceptedBy)}` : null,
+      item.clickability === "offscreen" ? "offscreen" : null,
       item.name ? `name=${item.name}` : null,
       item.id ? `id=${item.id}` : null,
       item.label ? `label=${JSON.stringify(item.label)}` : null,

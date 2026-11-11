@@ -89,6 +89,10 @@ an account. Do not change the active account unless the user asked for it.
   npm prefix first in the user `PATH`.
 - CDP down: use `pbc open <url>`.
 - Stale refs: take a fresh snapshot and retry once.
+- Intercepted refs: inspect `pbc tab snapshot active --json` for
+  `clickability: "intercepted"` and its `interceptedBy` description. Dismiss
+  only a recognized dialog or overlay, take a fresh snapshot, then retry; do not
+  force-click through an unknown blocker.
 - Missing iframe control: run `pbc tab frames active`, then use `--frame`.
 - Suspected reload: set a random page value and record
   `performance.timeOrigin`, snapshot, wait, and compare both values.

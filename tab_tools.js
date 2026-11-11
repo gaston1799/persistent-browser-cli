@@ -778,6 +778,46 @@ function describeSignature(expected) {
   return parts.join(" ");
 }
 
+function describeInterceptor(interceptor) {
+  if (!interceptor) return "an unknown element";
+  const parts = [`<${interceptor.tag || "element"}>`];
+  if (interceptor.id) parts.push(`#${interceptor.id}`);
+  if (interceptor.className) parts.push(`class=${JSON.stringify(interceptor.className)}`);
+  if (interceptor.role) parts.push(`role=${interceptor.role}`);
+  if (interceptor.ariaLabel) parts.push(`aria-label=${JSON.stringify(interceptor.ariaLabel)}`);
+  if (interceptor.text) parts.push(`text=${JSON.stringify(interceptor.text)}`);
+  if (interceptor.dialog && interceptor.dialog !== interceptor.id) parts.push(`inside-dialog=${JSON.stringify(interceptor.dialog)}`);
+  return parts.join(" ");
+}
+
+async function locatorInterception(locator) {
+  return locator.evaluate((node) => {
+    const rect = node.getBoundingClientRect();
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(innerWidth, rect.right);
+    const bottom = Math.min(innerHeight, rect.bottom);
+    if (right <= left || bottom <= top) return { status: "offscreen" };
+    const x = left + (right - left) / 2;
+    const y = top + (bottom - top) / 2;
+    const hit = document.elementFromPoint(x, y);
+    const associatedLabel = hit?.closest?.("label");
+    if (hit && (hit === node || node.contains(hit) || associatedLabel?.control === node)) return { status: "clear", x, y };
+    const dialog = hit?.closest?.('dialog, [role="dialog"], [aria-modal="true"]');
+    const summarize = (element) => element ? {
+      tag: element.tagName.toLowerCase(),
+      id: element.id || "",
+      className: typeof element.className === "string" ? element.className.trim().replace(/\s+/g, " ").slice(0, 100) : "",
+      role: element.getAttribute("role") || "",
+      ariaLabel: element.getAttribute("aria-label") || "",
+      text: (element.innerText || element.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120),
+    } : null;
+    const blocker = summarize(hit);
+    if (blocker && dialog) blocker.dialog = dialog.id || dialog.getAttribute("aria-label") || dialog.getAttribute("role") || dialog.tagName.toLowerCase();
+    return { status: "intercepted", x, y, interceptor: blocker };
+  }).catch(() => null);
+}
+
 async function locatorExists(locator) {
   const count = await locator.count().catch(() => 0);
   return count > 0;
@@ -862,6 +902,10 @@ async function clickLocatorFastFail(locator, options = {}) {
     if (!state.visible) {
       throw new Error(`Cannot click target: ${describeState(state)} is not visible.`);
     }
+  }
+  const interception = await locatorInterception(locator);
+  if (interception?.status === "intercepted") {
+    throw new Error(`Cannot click target: the click point is intercepted by ${describeInterceptor(interception.interceptor)}. Dismiss the blocking dialog or overlay, take a fresh snapshot, and retry.`);
   }
   try {
     await locator.click({ timeout, button });
@@ -1006,15 +1050,29 @@ async function withDirectPageSession(target, fn) {
       clearTimeout(timer);
       for (const waiter of pending.values()) waiter.reject(error || new Error("Direct page CDP session closed."));
       pending.clear();
-      for (const waiter of eventWaiters) waiter.reject(error || new Error("Direct page CDP session closed."));
+      for (const waiter of eventWaiters) {
+        clearTimeout(waiter.timer);
+        waiter.reject(error || new Error("Direct page CDP session closed."));
+      }
       eventWaiters.clear();
-      try { ws.close(); } catch {}
-      if (error) reject(error);
-      else resolve(value);
+      const complete = () => {
+        if (error) reject(error);
+        else resolve(value);
+      };
+      if (ws.readyState === WebSocket.CLOSED) {
+        complete();
+        return;
+      }
+      ws.addEventListener("close", complete, { once: true });
+      try { ws.close(); } catch { complete(); }
     }
 
     function send(method, params = {}, useSession = true) {
       return new Promise((resolveMessage, rejectMessage) => {
+        if (settled) {
+          rejectMessage(new Error("Direct page CDP session is already closed."));
+          return;
+        }
         const id = nextId++;
         pending.set(id, { resolve: resolveMessage, reject: rejectMessage, method, startedAt: Date.now() });
         ws.send(JSON.stringify({ id, method, params, ...(useSession && sessionId ? { sessionId } : {}) }));
@@ -1043,6 +1101,7 @@ async function withDirectPageSession(target, fn) {
       }
     });
     ws.addEventListener("message", (event) => {
+      if (settled) return;
       try {
         const message = JSON.parse(String(event.data || "{}"));
         if (message.method) {
@@ -1352,7 +1411,24 @@ async function directPageClickRef(target, expected, options = {}) {
         const style = getComputedStyle(this);
         const rect = this.getBoundingClientRect();
         if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0) return { error: "hidden" };
-        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+        const x = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        const hit = document.elementFromPoint(x, y);
+        const associatedLabel = hit?.closest?.("label");
+        if (!hit || (hit !== this && !this.contains(hit) && associatedLabel?.control !== this)) {
+          const dialog = hit?.closest?.('dialog, [role="dialog"], [aria-modal="true"]');
+          const interceptor = hit ? {
+            tag: hit.tagName.toLowerCase(),
+            id: hit.id || "",
+            className: typeof hit.className === "string" ? hit.className.trim().replace(/\\s+/g, " ").slice(0, 100) : "",
+            role: hit.getAttribute("role") || "",
+            ariaLabel: hit.getAttribute("aria-label") || "",
+            text: (hit.innerText || hit.textContent || "").trim().replace(/\\s+/g, " ").slice(0, 120),
+          } : null;
+          if (interceptor && dialog) interceptor.dialog = dialog.id || dialog.getAttribute("aria-label") || dialog.getAttribute("role") || dialog.tagName.toLowerCase();
+          return { error: "intercepted", x, y, interceptor };
+        }
+        return { x, y };
       }`,
       returnByValue: true,
     });
@@ -1502,6 +1578,29 @@ function collectSnapshotItemsInPage() {
     return `/${segments.join("/")}`;
   }
 
+  function hitTest(node) {
+    const rect = node.getBoundingClientRect();
+    const left = Math.max(0, rect.left);
+    const top = Math.max(0, rect.top);
+    const right = Math.min(innerWidth, rect.right);
+    const bottom = Math.min(innerHeight, rect.bottom);
+    if (right <= left || bottom <= top) return { clickability: "offscreen", interceptedBy: null };
+    const hit = document.elementFromPoint(left + (right - left) / 2, top + (bottom - top) / 2);
+    const associatedLabel = hit?.closest?.("label");
+    if (hit && (hit === node || node.contains(hit) || associatedLabel?.control === node)) return { clickability: "clear", interceptedBy: null };
+    const dialog = hit?.closest?.('dialog, [role="dialog"], [aria-modal="true"]');
+    const interceptedBy = hit ? {
+      tag: hit.tagName.toLowerCase(),
+      id: hit.id || "",
+      className: typeof hit.className === "string" ? hit.className.trim().replace(/\s+/g, " ").slice(0, 100) : "",
+      role: hit.getAttribute("role") || "",
+      ariaLabel: hit.getAttribute("aria-label") || "",
+      text: (hit.innerText || hit.textContent || "").trim().replace(/\s+/g, " ").slice(0, 120),
+    } : null;
+    if (interceptedBy && dialog) interceptedBy.dialog = dialog.id || dialog.getAttribute("aria-label") || dialog.getAttribute("role") || dialog.tagName.toLowerCase();
+    return { clickability: "intercepted", interceptedBy };
+  }
+
   return Array.from(document.querySelectorAll(selector))
     .filter((node) => {
       const style = window.getComputedStyle(node);
@@ -1519,6 +1618,7 @@ function collectSnapshotItemsInPage() {
       const text = (node.innerText || node.textContent || "").trim().replace(/\s+/g, " ").slice(0, 160);
       const value = "value" in node ? String(node.value || "").slice(0, 160) : "";
       const label = (getLabel(node) || aria || placeholder || text || value).replace(/\s+/g, " ").slice(0, 160);
+      const hit = hitTest(node);
       return {
         ref: `e${index}`,
         selector: getXPath(node),
@@ -1531,6 +1631,8 @@ function collectSnapshotItemsInPage() {
         text,
         value,
         disabled: Boolean(node.disabled || node.getAttribute("aria-disabled") === "true"),
+        clickability: hit.clickability,
+        interceptedBy: hit.interceptedBy,
       };
     });
 }
@@ -1644,6 +1746,9 @@ async function clickTab(port, token, target, options = {}) {
     }
     const result = await directPageClickRef(tab, expected, { button });
     if (result?.error) {
+      if (result.error === "intercepted") {
+        throw new Error(`Cannot click ref ${raw.toLowerCase()}: the click point is intercepted by ${describeInterceptor(result.interceptor)}. Dismiss the blocking dialog or overlay, take a fresh snapshot, and retry.`);
+      }
       throw new Error(`Cannot click ref ${raw.toLowerCase()}: ${result.error}. Run 'pbc tab snapshot' again and use a fresh ref.`);
     }
     return { clicked: raw, mode: "ref-direct", url: tab.url };

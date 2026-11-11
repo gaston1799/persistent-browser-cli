@@ -322,6 +322,13 @@ fails fast (<5s) with a one-line diff (old vs new element) instead of looping on
 30s actionability wait. Quoted URLs/args from cmd.exe have stray surrounding
 quotes stripped automatically.
 
+Snapshots also hit-test visible controls. JSON output reports `clickability` as
+`clear`, `offscreen`, or `intercepted`; intercepted controls include an
+`interceptedBy` summary of the dialog or overlay receiving the click. Ref clicks
+repeat that hit-test immediately before dispatch and fail with the blocker’s id,
+role, label, and text instead of silently clicking the wrong layer. Dismiss only
+a recognized blocker, take a fresh snapshot, and retry.
+
 `snapshot` is read-only with respect to the page DOM. Main-frame snapshots use
 a lightweight direct page-CDP evaluation and keep their ref metadata outside
 the page, avoiding reloads in detach-sensitive applications such as YouTube
