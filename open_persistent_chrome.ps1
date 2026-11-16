@@ -20,6 +20,29 @@ if (!(Test-Path -LiteralPath $ChromeExe)) {
   throw "Chrome executable not found at: $ChromeExe"
 }
 
+# Chrome forwards launches for an already-open profile to its existing process;
+# the new --remote-debugging-port is ignored. Detect this before opening a tab
+# and waiting for an endpoint that can never appear.
+$requestedProfile = [IO.Path]::GetFullPath($UserDataDir).TrimEnd('\', '/')
+$browserName = [IO.Path]::GetFileName($ChromeExe).Replace("'", "''")
+$profileOwners = @(Get-CimInstance Win32_Process -Filter "Name='$browserName'" -ErrorAction Stop)
+foreach ($owner in $profileOwners) {
+  $commandLine = [string]$owner.CommandLine
+  if ($commandLine -match '(?:^|\s)--type(?:=|\s)') { continue }
+  $profileMatch = [regex]::Match($commandLine, '(?:^|\s)--user-data-dir(?:=|\s+)(?:"([^"]+)"|(\S+))')
+  if (!$profileMatch.Success) { continue }
+  $ownerProfile = if ($profileMatch.Groups[1].Success) { $profileMatch.Groups[1].Value } else { $profileMatch.Groups[2].Value }
+  if ([IO.Path]::GetFullPath($ownerProfile).TrimEnd('\', '/') -ine $requestedProfile) { continue }
+  $portMatch = [regex]::Match($commandLine, '(?:^|\s)--remote-debugging-port(?:=|\s+)(\d+)')
+  if (!$portMatch.Success) {
+    throw "PBC profile is already held by browser PID $($owner.ProcessId) without a debugging port. Close that profile before relaunching; no browser was closed."
+  }
+  $ownerPort = [int]$portMatch.Groups[1].Value
+  if ($ownerPort -ne $RemoteDebuggingPort) {
+    throw "PBC profile is already held by browser PID $($owner.ProcessId) on port $ownerPort, but port $RemoteDebuggingPort was requested. Use --port $ownerPort or align DEFAULT_CDP_PORT in config.local.json with that port. No tab was opened and no browser was closed."
+  }
+}
+
 New-Item -ItemType Directory -Force -Path $UserDataDir | Out-Null
 
 $args = @(

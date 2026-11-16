@@ -9,6 +9,21 @@ Use `pbc` or `pbc-cli` for browser work that benefits from a persistent Chrome
 profile. Prefer its native commands; use `pbc pw` only when the native surface
 does not support the required operation.
 
+## Exclusive use and navigation
+
+Only one agent may use PBC at a time, including workers in a Switchyard swarm
+sharing a coordination directory. Before using PBC, check shared coordination
+state and claim the browser through the swarm's existing mechanism. If another
+worker owns it, wait for explicit release; release your claim when finished. A
+tab list alone does not establish that the browser is unclaimed. If `pbc doctor`
+reports CDP down, assume no agent is currently using PBC, but coordinate a claim
+before starting it to prevent a race. Do not interrupt an active user or worker.
+
+Prefer navigation using fresh snapshots and visible links, buttons, and search
+controls. Avoid `pbc tab goto` and equivalent direct navigation when a normal UI
+route is available; it can trigger anti-bot checks. Direct navigation is suitable
+when necessary, such as opening the initial site or when UI navigation is unavailable.
+
 ## Start and inspect
 
 Run `pbc doctor` before diagnosing install or browser health. If CDP is down,
@@ -72,9 +87,16 @@ the command surface and manifest schema as unstable while it is beta.
 ## Safety and login boundaries
 
 Reuse the saved profile. Use the requested sign-in provider, usually Google,
-when login is required. Stop for CAPTCHA, passkeys requiring the user, unknown
-2FA, payment confirmation, government ID, or legal signature. Never expose
-cookies, passwords, recovery codes, or private account screenshots.
+when login is required. Stop for passkeys requiring the user, unknown 2FA,
+payment confirmation, government ID, or legal signature. Never expose cookies,
+passwords, recovery codes, or private account screenshots.
+
+For CAPTCHA or human-verification challenges, including press-and-hold, do not
+automate a solution unless the operator explicitly requests or authorizes it.
+If encountered, ask whether to attempt it; remote users may not be able to use
+the browser themselves. If authorized, make at most three attempts, then report
+failure and any legitimate alternatives. Ordinary non-CAPTCHA press-and-hold
+controls are not challenges.
 
 Opening menus and inspecting available accounts is not the same as selecting
 an account. Do not change the active account unless the user asked for it.
@@ -96,7 +118,6 @@ an account. Do not change the active account unless the user asked for it.
 - Missing iframe control: run `pbc tab frames active`, then use `--frame`.
 - Suspected reload: set a random page value and record
   `performance.timeOrigin`, snapshot, wait, and compare both values.
-- Do not automate human-verification controls.
 
 If `pbc` is not installed, use the latest release installer or follow the
 source installation instructions at
